@@ -6,15 +6,29 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { optimize } from "svgo";
 
+function loadJSZip(): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (typeof window !== "undefined" && (window as any).JSZip) { resolve((window as any).JSZip); return; }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    script.onload = () => resolve((window as any).JSZip);
+    script.onerror = () => reject(new Error("Failed to load JSZip"));
+    document.head.appendChild(script);
+  });
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-const STORAGE_KEY = "qproc_v9";
+const STORAGE_KEY = "qproc_v13";
 
 // ── External APIs ─────────────────────────────────────────────────────────────
 // Quran.com API v4 — tafsir, translations, metadata (no auth needed for basic reads)
-const QURAN_API     = "https://api.quran.com/api/v4";
+// api.quran-tafseer.com — free Arabic tafsir API
+// Docs: http://api.quran-tafseer.com/en/docs/
+// GET /tafseer/{tafseer_id}/{sura_number}/{start_ayah}/{end_ayah}
+const QURAN_TAFSEER_API = "https://api.quran-tafseer.com/tafseer";
 // EveryAyah.com — Warsh audio MP3s by ayah
 // Format: https://everyayah.com/data/{reciter}/{surah3digit}{ayah3digit}.mp3
 const WARSH_RECITERS: Record<string, { name: string; path: string }> = {
@@ -25,13 +39,16 @@ const WARSH_RECITERS: Record<string, { name: string; path: string }> = {
 };
 const DEFAULT_WARSH = "warsh_husary";
 // Tafsir IDs from Quran.com API (Arabic tafsirs)
+// IDs from api.quran-tafseer.com
 const TAFSIR_SOURCES: Record<string, { name: string; id: number }> = {
-  ibn_kathir:   { name: "ابن كثير",           id: 169 },
-  jalalayn:     { name: "الجلالين",            id: 74  },
-  tabari:       { name: "الطبري",              id: 91  },
-  saadi:        { name: "السعدي",              id: 93  },
-  muyassar:     { name: "الميسر",              id: 16  },
-  baghawy:      { name: "البغوي",              id: 101 },
+  muyassar:   { name: "الميسر",     id: 1  },
+  jalalayn:   { name: "الجلالين",   id: 2  },
+  saadi:      { name: "السعدي",     id: 3  },
+  ibn_kathir: { name: "ابن كثير",   id: 4  },
+  baghawy:    { name: "البغوي",     id: 6  },
+  tabari:     { name: "الطبري",     id: 8  },
+  qortoby:    { name: "القرطبي",    id: 9  },
+  ibn_ashoor: { name: "ابن عاشور",  id: 10 },
 };
 const DEFAULT_TAFSIR = "ibn_kathir";
 
@@ -108,8 +125,8 @@ interface ParsedPage {
   originalBytes: number;
   compressedBytes: number;
   hizbMarks: HizbMark[];
-  // Hizb position at START of page (before any marks on it)
   hizbAtStart: number;
+  hasSajda: boolean;    // page contains a sajda (¦ U+00A6 in data-txt)
 }
 
 interface HistoryEntry {
@@ -120,9 +137,10 @@ interface HistoryEntry {
   parsed: ParsedPage;
   tsx: string;
   savedAt: number;
-  // Per-ayah text overrides keyed "surahNum:ayahNum"
-  searchOverrides: Record<string, string>;  // searchDataManual
-  copyOverrides:   Record<string, string>;  // copyData — clean copy text (user-supplied from Quran source)
+  searchOverrides: Record<string, string>;
+  copyOverrides:   Record<string, string>;
+  pageAlign: "center" | "justify" | "flex-start" | "flex-end";  // per-page alignment
+  wordGap:   number;   // px gap between words (0 = tight, default 2)
 }
 
 interface WordOffset { x: number; y: number }
@@ -398,16 +416,24 @@ function parseQuranHtml(
         !words.some((w) => w.ayahNumber !== null && w.ayahNumber === aid);
       // Get the per-surah ayah number from the ayah marker word (an_N class)
       const markerWord = words.find((w) => w.isAyahMarker && w.ayahNumber !== null);
-      // Fallback: if no marker found yet (continues from prev page), 
-      // use sequential position within this page's segment
-      const ayahNum = markerWord?.ayahNumber ?? aid;
+      // Also check non-marker words that have an_N class (some sources put an_ on content words)
+      const anyWordWithAyahNum = words.find((w) => w.ayahNumber !== null && w.ayahNumber > 0);
+      // If this ayah has NO marker on this page (continues from prev page),
+      // ayahNumber is unknown — we mark it so we can skip copyData matching.
+      // We use the anyWordWithAyahNum fallback which gets the right value
+      // from content words that carry the an_N class.
+      const ayahNumRaw = markerWord?.ayahNumber ?? anyWordWithAyahNum?.ayahNumber ?? null;
+      const ayahNum = ayahNumRaw ?? 0;  // 0 = unknown (continues from prev page)
       ayahs.push({ aid, ayahNum, surahNumber: sn, words, isComplete: hasMarker, continuesFromPrev });
     }
     segments.push({ surahNumber: sn, surahTitle: seg.surahTitle, ayahs });
   }
 
+  // Detect sajda: ¦ (U+00A6) in any word's dataTxt
+  const hasSajda = lines.some((l) => l.words.some((w) => w.dataTxt.includes("¦")));
+
   return {
-    result: { pageNumber, surahNumbers, segments, lines, hizbMarks, hizbAtStart: hizbCursorIn },
+    result: { pageNumber, surahNumbers, segments, lines, hizbMarks, hizbAtStart: hizbCursorIn, hasSajda },
     hizbCursorOut: hizbCursor,
   };
 }
@@ -422,6 +448,8 @@ function generateTsx(
   copyOverrides: Record<string, string> = {},
   entryAnnotations: Record<string, Annotation> = {},
   lineGap: number = 4,
+  pageAlign: HistoryEntry["pageAlign"] = "justify",
+  wordGap: number = 2,
 ): string {
   const { pageNumber, surahNumbers, segments, lines, hizbMarks, hizbAtStart } = parsed;
 
@@ -445,7 +473,7 @@ function generateTsx(
         `      searchTxtAuto: ${JSON.stringify(w.searchTxtAuto)},`,
         `      searchTxtManual: ${JSON.stringify(w.searchTxtManual)},`,
         `      ayahId: ${w.aid ?? "null"}, surahNumber: ${w.surahNumber},`,
-        `      isAyahMarker: ${w.isAyahMarker}, ayahNumber: ${w.ayahNumber ?? "null"}${hizbStr}${tafsirStr}${riwayaStr},`,
+        `      isAyahMarker: ${w.isAyahMarker}, ayahNumber: ${w.ayahNumber ?? "null"}, isSajda: ${w.dataTxt.includes("\u00A6")}${hizbStr}${tafsirStr}${riwayaStr},`,
         `      svg: ${JSON.stringify(w.svgCompressed || w.svgRaw)},`,
         `    }`,
       ].join("\n");
@@ -504,6 +532,9 @@ export const PAGE_NUMBER    = ${pageNumber};
 export const SURAH_NUMBERS  = [${surahNumbers.join(", ")}];
 export const HIZB_AT_START  = ${hizbAtStart};
 export const LINE_GAP_PX    = ${lineGap};
+export const PAGE_ALIGN     = "${pageAlign}";
+export const WORD_GAP_PX    = ${wordGap};
+export const HAS_SAJDA      = ${parsed.hasSajda};
 
 export interface WordData {
   id: string;
@@ -794,6 +825,52 @@ function saveAppState(state: AppState) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// BACKUP — Export / Import full app state as JSON
+// ══════════════════════════════════════════════════════════════════════════════
+
+const BACKUP_VERSION = 2;
+
+function exportBackup(state: AppState): void {
+  const payload = { _version: BACKUP_VERSION, _date: new Date().toISOString(), ...state };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `quran-processor-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importBackup(file: File): Promise<AppState> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const raw = JSON.parse(e.target?.result as string);
+        // Validate and merge with defaults
+        const d = defaultState();
+        const restored: AppState = {
+          history:        Array.isArray(raw.history)  ? raw.history  : d.history,
+          allOffsets:     raw.allOffsets  ?? d.allOffsets,
+          allColors:      raw.allColors   ?? d.allColors,
+          annotations:    raw.annotations ?? d.annotations,
+          lineGap:        typeof raw.lineGap === "number" ? raw.lineGap : d.lineGap,
+          hizbCursor:     typeof raw.hizbCursor === "number" ? raw.hizbCursor : d.hizbCursor,
+          lastPageNumber: raw.lastPageNumber ?? d.lastPageNumber,
+          svgoFloatPrec:  raw.svgoFloatPrec  ?? d.svgoFloatPrec,
+          svgoMultipass:  raw.svgoMultipass  ?? d.svgoMultipass,
+        };
+        resolve(restored);
+      } catch (err: any) {
+        reject(new Error("ملف النسخة الاحتياطية تالف أو غير صالح: " + err.message));
+      }
+    };
+    reader.onerror = () => reject(new Error("فشل قراءة الملف"));
+    reader.readAsText(file);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // SVG COLOR INJECTION  (preview only)
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -806,6 +883,35 @@ function injectSvgColor(svg: string, color: string): string {
 // ══════════════════════════════════════════════════════════════════════════════
 // BATCH IMPORT HELPER
 // ══════════════════════════════════════════════════════════════════════════════
+
+// Parse a Quran .txt file with (N) end-markers into a copyData map
+// FORMAT: Each LINE = one surah. (N) = END marker after each ayah.
+// Line 1 → surahSequence[0], Line 2 → surahSequence[1], ...
+function parseCopyTextFile(raw: string, surahSequence: number[]): Record<string, string> {
+  const map: Record<string, string> = {};
+
+  // Split into lines — each non-empty line is one surah
+  const rawLines = raw.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
+
+  for (let lineIdx = 0; lineIdx < rawLines.length; lineIdx++) {
+    const surah = surahSequence[Math.min(lineIdx, surahSequence.length - 1)] ?? 1;
+    // Collapse inner whitespace
+    const normalized = rawLines[lineIdx].replace(/\s+/g, ' ').trim();
+    // Split on (N) end-markers
+    const parts = normalized.split(/\s*\((\d+)\)\s*/);
+    for (let i = 0; i < parts.length; i += 2) {
+      const ayahText  = parts[i].trim();
+      const markerStr = parts[i + 1];
+      const markerNum = markerStr !== undefined ? parseInt(markerStr) : null;
+      if (markerNum !== null && ayahText) {
+        const key = `${surah}:${markerNum}`;
+        map[key] = map[key] ? `${map[key]} ${ayahText}` : ayahText;
+      }
+    }
+  }
+  return map;
+}
+
 
 function guessPageNumber(filename: string): number {
   // Match: page_2, page2, p2, 002, page_002, etc.
@@ -863,41 +969,46 @@ async function processOnePage(
 
 // CORS proxy — wraps any URL so it can be fetched from localhost/dev
 // Uses allorigins.win which mirrors the response with CORS headers
-function corsProxy(url: string): string {
-  return `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-}
+// Fetch tafsir range from api.quran-tafseer.com
+// GET /tafseer/{tafseer_id}/{sura_number}/{start_ayah}/{end_ayah}
+// Returns array: [{ ayah_number: N, text: "..." }, ...]
+// Tries direct first, then CORS proxies
+async function fetchTafsirRange(
+  surah: number, tafsirId: number, startAyah: number, endAyah: number
+): Promise<Record<number, string>> {
+  const directUrl = `${QURAN_TAFSEER_API}/${tafsirId}/${surah}/${startAyah}/${endAyah}`;
 
-async function fetchTafsirPage(surah: number, tafsirId: number, startAyah: number, endAyah: number): Promise<Record<number, string>> {
-  // Quran.com v4: GET /tafsirs/{id}/ayahs?chapter_number={surah}
-  // This endpoint returns all tafsir ayahs for a surah
-  const directUrl = `${QURAN_API}/tafsirs/${tafsirId}?chapter_number=${surah}`;
-  
-  // Try direct first (works if deployed on quran.com-compatible origin)
-  // Fall back to CORS proxy
+  const proxies = [
+    () => fetch(directUrl, { headers: { Accept: "application/json" } }),
+    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`),
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(directUrl)}`),
+  ];
+
   let data: any = null;
-  
-  // Try direct
-  try {
-    const r = await fetch(directUrl, { headers: { Accept: "application/json" } });
-    if (r.ok) data = await r.json();
-  } catch { /* fall through to proxy */ }
-  
-  // Try proxy
-  if (!data) {
-    const r = await fetch(corsProxy(directUrl));
-    if (!r.ok) throw new Error(`Failed to fetch tafsir (${r.status})`);
-    const text = await r.text();
-    data = JSON.parse(text);
+  let lastErr = "no response";
+
+  for (const attempt of proxies) {
+    try {
+      const r = await attempt();
+      if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
+      const text = await r.text();
+      const parsed = JSON.parse(text);
+      // Accept if array with ayah_number field OR single object
+      if (Array.isArray(parsed) && parsed.length > 0) { data = parsed; break; }
+      if (parsed?.ayah_number) { data = [parsed]; break; }
+      if (parsed?.text) { data = [{ ayah_number: startAyah, text: parsed.text }]; break; }
+      lastErr = "empty response";
+    } catch (e: any) { lastErr = e.message; }
   }
-  
-  // Response shape: { tafsirs: [{ verse_key: "2:1", text: "..." }] }
-  const tafsirs: Array<{ verse_key: string; text: string }> = data?.tafsirs ?? data?.data ?? [];
+
+  if (!data) throw new Error(`فشل جلب التفسير: ${lastErr}`);
+
   const result: Record<number, string> = {};
-  for (const item of tafsirs) {
-    const parts = (item.verse_key ?? "").split(":");
-    const ayahNum = parseInt(parts[1] ?? "0");
-    if (!isNaN(ayahNum) && ayahNum >= startAyah && ayahNum <= endAyah) {
-      result[ayahNum] = (item.text ?? "").replace(/<[^>]*>/g, "").trim();
+  for (const item of data) {
+    const num = parseInt(String(item.ayah_number ?? 0));
+    if (!isNaN(num) && num > 0) {
+      // Strip any HTML tags
+      result[num] = String(item.text ?? "").replace(/<[^>]*>/g, "").trim();
     }
   }
   return result;
@@ -953,16 +1064,21 @@ function TafsirAudioPanel({
     const tafsirId = TAFSIR_SOURCES[tafsirSource].id;
     try {
       const result: Record<string, string> = {};
-      // Group by surah for efficient fetching
+      // Group ayahs by surah, skip unknown (ayahNum=0 = continuing from prev page)
       const bySurah: Record<number, number[]> = {};
-      for (const a of ayahs) { if (!bySurah[a.surahNumber]) bySurah[a.surahNumber] = []; bySurah[a.surahNumber].push(a.ayahNum); }
+      for (const a of ayahs) {
+        if (a.ayahNum === 0) continue; // unknown — continuing ayah
+        if (!bySurah[a.surahNumber]) bySurah[a.surahNumber] = [];
+        bySurah[a.surahNumber].push(a.ayahNum);
+      }
       for (const [surahStr, ayahNums] of Object.entries(bySurah)) {
         const surah = parseInt(surahStr);
-        const aids = ayahNums;
-        const min = Math.min(...aids); const max = Math.max(...aids);
-        const fetched = await fetchTafsirPage(surah, tafsirId, min, max);
+        const min = Math.min(...ayahNums);
+        const max = Math.max(...ayahNums);
+        // api.quran-tafseer.com: range endpoint
+        const fetched = await fetchTafsirRange(surah, tafsirId, min, max);
         for (const [ayahNum, text] of Object.entries(fetched)) {
-          result[`${surah}:${ayahNum}`] = text;  // key = surah:ayahNum (per-surah standard)
+          result[`${surah}:${ayahNum}`] = text;
         }
       }
       setFetchedTafsirs(result);
@@ -1023,36 +1139,24 @@ function TafsirAudioPanel({
   const applySinglePageText = () => {
     if (!singlePageText.trim()) return;
 
-    // (N) is an END-marker: text BEFORE (1) = ayah 1, text between (1)&(2) = ayah 2
-    const normalized = singlePageText
-      .replace(/\r\n|\r|\n/g, " ").replace(/\s+/g, " ").trim();
-
-    const parts = normalized.split(/\s*\((\d+)\)\s*/);
-    // parts[0]=ayah1text, parts[1]="1", parts[2]=ayah2text, parts[3]="2", ...
-
+    // Line-based: each line = one surah on this page
+    const rawLines = singlePageText.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
     const segs = activeEntry.parsed.segments;
-    let surahIdx = 0;
-    let currentSurah = segs[surahIdx]?.surahNumber ?? 1;
-    let lastMarkerNum = 0;
     const newEdits: Record<string, string> = {};
 
-    for (let i = 0; i < parts.length; i += 2) {
-      const ayahText  = parts[i].trim();
-      const markerStr = parts[i + 1];
-      const markerNum = markerStr !== undefined ? parseInt(markerStr) : null;
-
-      // Surah change when number resets to 1 after higher
-      if (markerNum === 1 && lastMarkerNum > 1) {
-        surahIdx = Math.min(surahIdx + 1, segs.length - 1);
-        currentSurah = segs[surahIdx]?.surahNumber ?? currentSurah;
+    for (let lineIdx = 0; lineIdx < rawLines.length; lineIdx++) {
+      const surahNum = segs[Math.min(lineIdx, segs.length - 1)]?.surahNumber ?? segs[0]?.surahNumber ?? 1;
+      const normalized = rawLines[lineIdx].replace(/\s+/g, " ").trim();
+      const parts = normalized.split(/\s*\((\d+)\)\s*/);
+      for (let i = 0; i < parts.length; i += 2) {
+        const ayahText  = parts[i].trim();
+        const markerStr = parts[i + 1];
+        const markerNum = markerStr !== undefined ? parseInt(markerStr) : null;
+        if (markerNum !== null && ayahText) {
+          const key = `${surahNum}:${markerNum}`;
+          newEdits[key] = newEdits[key] ? `${newEdits[key]} ${ayahText}` : ayahText;
+        }
       }
-
-      if (markerNum !== null && ayahText) {
-        const key = `${currentSurah}:${markerNum}`;
-        newEdits[key] = newEdits[key] ? `${newEdits[key]} ${ayahText}` : ayahText;
-      }
-
-      if (markerNum !== null) lastMarkerNum = markerNum;
     }
 
     setCopyEdits((prev) => ({ ...prev, ...newEdits }));
@@ -1124,12 +1228,16 @@ function TafsirAudioPanel({
       )}
 
       {/* Info note */}
-      <div style={{ fontSize: 10, color: "#4b5563", lineHeight: 1.7, background: "#0f1117", border: "1px solid #1e2332", borderRadius: 6, padding: "8px 10px" }}>
-        <b style={{ color: "#9ca3af" }}>📖 التفسير:</b> يُجلب من Quran.com API v4 عبر CORS proxy — يدعم:{" "}
-        {Object.values(TAFSIR_SOURCES).map((v) => v.name).join(" · ")}
+      <div style={{ fontSize: 10, color: "#4b5563", lineHeight: 1.9, background: "#0f1117", border: "1px solid #1e2332", borderRadius: 6, padding: "8px 10px" }}>
+        <b style={{ color: "#9ca3af" }}>📖 التفسير:</b> api.quran-tafseer.com — يدعم {Object.keys(TAFSIR_SOURCES).length} مصادر عربية.<br />
+        للتحقق: افتح{" "}
+        <a href={`https://api.quran-tafseer.com/tafseer/${TAFSIR_SOURCES[tafsirSource].id}/1/1/7`}
+          target="_blank" rel="noreferrer"
+          style={{ color: "#7dd3fc" }}>هذا الرابط</a>{" "}
+        في المتصفح (يجب أن يُرجع JSON).
         <br />
-        <b style={{ color: "#9ca3af" }}>🎧 الصوت (ورش):</b> مباشر من everyayah.com —{" "}
-        {Object.values(WARSH_RECITERS).map((v) => v.name).join(" · ")}
+        <b style={{ color: "#9ca3af" }}>🎧 الصوت (ورش):</b> everyayah.com — اضغط ▶ مباشرة للتشغيل.
+        إذا لم يعمل: <a href={warshAudioUrl(1, 1, warshReciter)} target="_blank" rel="noreferrer" style={{ color: "#7dd3fc" }}>اختبر الرابط</a>
       </div>
 
       {/* Per-ayah table */}
@@ -1225,6 +1333,8 @@ function SvgChainPreviewer({
   colors, onColorChange,
   annotations, onAnnotationSave, onAnnotationDelete,
   lineGap, onLineGapChange,
+  pageAlign, onPageAlignChange,
+  wordGap, onWordGapChange,
 }: {
   parsed: ParsedPage;
   selectedWordId: string | null;
@@ -1238,6 +1348,10 @@ function SvgChainPreviewer({
   onAnnotationDelete: (id: string) => void;
   lineGap: number;
   onLineGapChange: (v: number) => void;
+  pageAlign: HistoryEntry["pageAlign"];
+  onPageAlignChange: (v: HistoryEntry["pageAlign"]) => void;
+  wordGap: number;
+  onWordGapChange: (v: number) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerW, setContainerW] = useState(800);
@@ -1333,6 +1447,32 @@ function SvgChainPreviewer({
                 style={{ ...SP.numInput, width: 54 }} />
               <span style={SP.dim}>px</span>
             </div>
+
+            {/* Word width % — controls SVG container width relative to auto */}
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={SP.dim}>Width %:</span>
+              <input type="number" min={-50} max={100} value={wordGap}
+                onChange={(e) => onWordGapChange(parseInt(e.target.value) || 0)}
+                style={{ ...SP.numInput, width: 54 }} />
+              <span style={{ ...SP.dim, fontSize: 9, color: wordGap === 0 ? "#4b5563" : "#c9a96e" }}>
+                {wordGap === 0 ? "auto" : wordGap > 0 ? `+${wordGap}% wider` : `${wordGap}% narrower`}
+              </span>
+            </div>
+
+            {/* Page alignment — per page, saved into TSX */}
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={SP.dim}>Align:</span>
+              <div style={{ display: "flex", gap: 2 }}>
+                {([["justify","⁞⁞","ممتد"],["center","⊟","وسط"],["flex-end","⊡","يمين"],["flex-start","⊞","يسار"]] as const).map(([v, icon, label]) => (
+                  <button key={v} title={label}
+                    style={{ ...SP.smallBtn, ...(pageAlign === v ? SP.btnOn : {}), padding: "2px 7px", fontSize: 13 }}
+                    onClick={() => onPageAlignChange(v)}>{icon}</button>
+                ))}
+              </div>
+              <span style={{ ...SP.dim, fontSize: 9, color: pageAlign === "justify" ? "#c9a96e" : "#4b5563" }}>
+                {pageAlign === "justify" ? "ممتد★" : pageAlign === "center" ? "وسط" : pageAlign === "flex-end" ? "يمين" : "يسار"}
+              </span>
+            </div>
           </>
         )}
 
@@ -1355,7 +1495,7 @@ function SvgChainPreviewer({
         )}
 
         {lineGroups.map((group, li) => (
-          <div key={li} style={{ display: "flex", flexDirection: "row-reverse", justifyContent: "center", alignItems: "flex-end", marginBottom: lineGap, height: DISPLAY_H, position: "relative", zIndex: 1 }}>
+          <div key={li} style={{ display: "flex", flexDirection: "row-reverse", justifyContent: pageAlign === "justify" ? "space-between" : pageAlign, alignItems: "flex-end", marginBottom: lineGap, height: DISPLAY_H, position: "relative", zIndex: 1, gap: pageAlign === "justify" ? 0 : wordGap }}>
             {group.map((m, wi) => {
               const offset = offsets[m.wordId] ?? { x: 0, y: 0 };
               const wColor = colors[m.wordId] ?? "";
@@ -1389,7 +1529,7 @@ function SvgChainPreviewer({
                       setAnnTitle(""); setAnnBody(""); setAnnSource("");
                     }
                   }}
-                  style={{ width: m.displayW, height: DISPLAY_H, flexShrink: 0, cursor: editMode ? "pointer" : "default", position: "relative", zIndex: isSel ? 10 : 1, transform: `translate(${pxX}px,${pxY}px)`, outline, outlineOffset: -1, borderRadius: 2, background: isSel ? "#c9a96e10" : "transparent" }}>
+                  style={{ width: Math.max(4, Math.round(m.displayW * (1 + wordGap / 100))), height: DISPLAY_H, flexShrink: 0, cursor: editMode ? "pointer" : "default", position: "relative", zIndex: isSel ? 10 : 1, transform: `translate(${pxX}px,${pxY}px)`, outline, outlineOffset: -1, borderRadius: 2, background: isSel ? "#c9a96e10" : "transparent" }}>
                   {(hasTafsir || hasRiwaya) && (
                     <div style={{ position: "absolute", top: 1, right: 1, display: "flex", gap: 1, zIndex: 20, pointerEvents: "none" }}>
                       {hasTafsir && <div style={{ width: 4, height: 4, borderRadius: "50%", background: "#10b981" }} />}
@@ -1661,14 +1801,7 @@ function BatchImportView({
 
     const map: Record<string, string> = {};
 
-    const normalized = rawText
-      .replace(/\r\n|\r|\n/g, " ").replace(/\s+/g, " ").trim();
-
-    // Split on (N) end-of-ayah markers — capture group keeps numbers
-    // Result: [text_ayah1, "1", text_ayah2, "2", ..., possible_trailing_text]
-    const parts = normalized.split(/\s*\((\d+)\)\s*/);
-
-    // Build ordered surah sequence from import items
+    // ── Build surah sequence from import items ──
     const surahSequence: number[] = [];
     for (const item of orderedItems) {
       if (!item.surahInput) continue;
@@ -1680,30 +1813,51 @@ function BatchImportView({
           surahSequence.push(n);
       }
     }
-    let surahSeqIdx = 0;
-    let currentSurah = surahSequence[0] ?? 1;
-    let lastMarkerNum = 0;
 
-    // parts[0] = text of ayah 1, parts[1] = "1", parts[2] = text of ayah 2 ...
-    for (let i = 0; i < parts.length; i += 2) {
-      const ayahText  = parts[i].trim();
-      const markerStr = parts[i + 1];
-      const markerNum = markerStr !== undefined ? parseInt(markerStr) : null;
+    // ── Split into lines — each non-empty line = one surah ──
+    const rawLines = rawText.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
 
-      // Surah change: ayah number reset 1→ after non-1 number
-      if (markerNum === 1 && lastMarkerNum > 1) {
-        surahSeqIdx = Math.min(surahSeqIdx + 1, surahSequence.length - 1);
-        currentSurah = surahSequence[surahSeqIdx];
+    // Map line index → surah number
+    // Line 0 → surahSequence[0], Line 1 → surahSequence[1], ...
+    // If rawLines has MORE lines than surahSequence (full Quran txt),
+    // we still only care about the lines for the surahs in surahSequence.
+    // Strategy: process ALL lines but only store keys for known surahs.
+    //
+    // HOWEVER: user may give full Quran (114 lines) but process pages 50-60.
+    // We need to map line N to the correct surah regardless of which surahs
+    // are in the batch items.
+    //
+    // Best approach: map by LINE INDEX directly to surahSequence index.
+    // Line 0 = first surah in surahSequence, Line 1 = second, etc.
+    // If the txt file starts from surah 1 (line 0 = Al-Fatiha) and
+    // surahSequence = [2, 3], then we skip lines 0 and start at line 1.
+    //
+    // SMART SKIP: find which line number corresponds to surahSequence[0]
+    // by counting lines = counting surahs (line N = surah N+1 if Fatiha is line 0).
+    // Since line index = surah index (0-based), surah S is at line S-1.
+    //
+    // So: for surahSequence[0] = S, start at rawLine[S-1].
+
+    if (surahSequence.length === 0) return map;
+
+    for (let seqIdx = 0; seqIdx < surahSequence.length; seqIdx++) {
+      const surah = surahSequence[seqIdx];
+      // Line index in txt = surah number - 1 (0-based, surah 1 = line 0)
+      const lineIdx = surah - 1;
+      if (lineIdx >= rawLines.length) continue; // line not in txt
+
+      const normalized = rawLines[lineIdx].replace(/\s+/g, " ").trim();
+      const parts = normalized.split(/\s*\((\d+)\)\s*/);
+
+      for (let i = 0; i < parts.length; i += 2) {
+        const ayahText  = parts[i].trim();
+        const markerStr = parts[i + 1];
+        const markerNum = markerStr !== undefined ? parseInt(markerStr) : null;
+        if (markerNum !== null && ayahText) {
+          const key = `${surah}:${markerNum}`;
+          map[key] = map[key] ? `${map[key]} ${ayahText}` : ayahText;
+        }
       }
-
-      // Only store if we have both text and a marker number
-      // (last chunk with no marker = incomplete ayah continuing to next page — skip)
-      if (markerNum !== null && ayahText) {
-        const key = `${currentSurah}:${markerNum}`;
-        map[key] = map[key] ? `${map[key]} ${ayahText}` : ayahText;
-      }
-
-      if (markerNum !== null) lastMarkerNum = markerNum;
     }
 
     return map;
@@ -1748,7 +1902,7 @@ function BatchImportView({
           }
         }
 
-        entries.push({ ...entry, searchOverrides: {}, copyOverrides: copyOvr });
+        entries.push({ ...entry, searchOverrides: {}, copyOverrides: copyOvr, pageAlign: "justify", wordGap: 2 });
         updateItem(it.id, { status: "done" });
       } catch (e: any) {
         updateItem(it.id, { status: "error", error: e.message });
@@ -1820,16 +1974,29 @@ function BatchImportView({
         </div>
       )}
 
-      {/* Quran clean copy text — feeds copyData per ayah by ayah-number matching */}
+      {/* Quran clean copy text — feeds copyData per ayah */}
       <div style={S.card}>
-        <div style={S.cardTitle}>📋 نص القرآن لحقل copyData</div>
-        <div style={{ fontSize: 11, color: "#9ca3af", marginBottom: 8, lineHeight: 1.8, direction: "rtl" }}>
-          الصق نص القرآن الكريم الكامل (أو حتى نهاية آخر صفحة مختارة).<br />
-          <b style={{ color: "#e8e6e0" }}>التنسيق المطلوب:</b> النص مع أرقام الآيات بين قوسين مثل <code style={S.ic}>(1)</code> <code style={S.ic}>(2)</code> ...<br />
-          المطابقة تتم <b>بالآية رقم</b> وليس بعدد الكلمات — النتيجة تُخزَّن في <code style={S.ic}>copyData</code> لكل آية.<br />
-          <span style={{ color: "#c9a96e" }}>يستمر التعيين عبر جميع الصفحات تلقائياً — لا تعيد اللصق من البداية.</span>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={S.cardTitle} >📋 نص القرآن لحقل copyData</div>
+          <label style={{ ...S.exportBtn, cursor: "pointer", fontSize: 10 }}>
+            📄 رفع ملف .txt
+            <input type="file" accept=".txt" style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => setQuranText(ev.target?.result as string ?? "");
+                reader.readAsText(f, "utf-8");
+                e.target.value = "";
+              }} />
+          </label>
         </div>
-        <textarea style={{ ...S.textarea, height: 140, direction: "rtl", fontFamily: "serif", fontSize: 13 }}
+        <div style={{ fontSize: 11, color: "#9ca3af", marginBottom: 8, lineHeight: 1.8, direction: "rtl" }}>
+          الصق النص أو ارفع ملف .txt — أرقام الآيات بين قوسين <code style={S.ic}>(1)</code> <code style={S.ic}>(2)</code> ...<br />
+          الرقم يأتي <b style={{ color: "#e8e6e0" }}>بعد</b> نص الآية (علامة نهاية): <code style={S.ic}>بِسۡمِ ٱللَّهِ... (1) ٱلۡحَمۡدُ... (2)</code><br />
+          <span style={{ color: "#c9a96e" }}>يستمر التعيين عبر جميع الصفحات — لا تعيد اللصق من البداية.</span>
+        </div>
+        <textarea style={{ ...S.textarea, height: 120, direction: "rtl", fontFamily: "serif", fontSize: 13 }}
           value={quranText} onChange={(e) => setQuranText(e.target.value)}
           placeholder={"بِسۡمِ ٱللَّهِ ٱلرَّحۡمَٰنِ ٱلرَّحِيمِ (1) ٱلۡحَمۡدُ لِلَّهِ رَبِّ ٱلۡعَٰلَمِينَ (2)..."} />
         {quranText.trim() && (() => {
@@ -1837,8 +2004,8 @@ function BatchImportView({
           return (
             <div style={{ fontSize: 10, color: count > 0 ? "#4ade80" : "#f87171", marginTop: 4 }}>
               {count > 0
-                ? `✅ تم اكتشاف ${count} رقم آية — سيتم المطابقة تلقائياً عند المعالجة`
-                : "⚠️ لم يتم اكتشاف أرقام آيات — تأكد من وجود (1) (2) ... في النص"}
+                ? `✅ ${count} آية مكتشفة — جاهز للمطابقة عند الضغط على Process All`
+                : "⚠️ لا أرقام آيات — تأكد من وجود (1) (2) ... في النص"}
             </div>
           );
         })()}
@@ -1883,6 +2050,7 @@ function HistoryPanel({ history, selectedId, onSelect, onRemove, onRename, onExp
               )}
               <div style={{ fontSize: 10, color: "#4b5563", marginTop: 2 }}>
                 Surah {e.surahNumbers.join(",")} &middot; {e.parsed.lines.length} lines &middot; {kb(e.parsed.compressedBytes)} KB
+                {e.parsed.hasSajda && <span style={{ color: "#4ade80", marginLeft: 4 }}>◆سجدة</span>}
                 {e.parsed.hizbMarks.map((h, i) => <span key={i} style={{ color: "#c9a96e", marginLeft: 4 }}>{h.symbol}</span>)}
               </div>
             </div>
@@ -1923,6 +2091,8 @@ export default function QuranProcessor() {
   const [hizbCursor,   setHizbCursor]   = useState(0);
   const [svgoFP,       setSvgoFP]       = useState(3);
   const [svgoMP,       setSvgoMP]       = useState(true);
+  const [backupError,  setBackupError]  = useState<string | null>(null);
+  const backupFileRef = useRef<HTMLInputElement>(null);
 
   // Load once on mount
   useEffect(() => {
@@ -1935,7 +2105,7 @@ export default function QuranProcessor() {
     setHizbCursor(s.hizbCursor);
     setSvgoFP(s.svgoFloatPrec);
     setSvgoMP(s.svgoMultipass);
-    // Set page number after load
+
     setPageNumber(s.lastPageNumber || 1);
     setReady(true);
   }, []);
@@ -1995,6 +2165,21 @@ export default function QuranProcessor() {
     setAnnotations((prev) => { const ex = { ...(prev[activeEntry.id] ?? {}) }; delete ex[annId]; return { ...prev, [activeEntry.id]: ex }; });
   }, [activeEntry]);
 
+  // Per-page alignment and word gap handlers
+  const handlePageAlignChange = useCallback((align: HistoryEntry["pageAlign"]) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, pageAlign: align };
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === activeEntry.id ? updated : e));
+  }, [activeEntry]);
+
+  const handleWordGapChange = useCallback((gap: number) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, wordGap: gap };
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === activeEntry.id ? updated : e));
+  }, [activeEntry]);
+
   // Copy text overrides handler
   const handleCopyOverrideSave = useCallback((entryId: string, overrides: Record<string, string>) => {
     setHistory((prev) => prev.map((e) => e.id === entryId ? { ...e, copyOverrides: { ...(e.copyOverrides ?? {}), ...overrides } } : e));
@@ -2016,7 +2201,7 @@ export default function QuranProcessor() {
         (done, total) => { setStep("compressing"); setCompProg({ done, total }); },
       );
       setHizbCursor(hizbCursorOut);
-      const full: HistoryEntry = { ...entry, searchOverrides: {}, copyOverrides: {} };
+      const full: HistoryEntry = { ...entry, searchOverrides: {}, copyOverrides: {}, pageAlign: "justify", wordGap: 2 };
       setHistory((prev) => { const i = prev.findIndex((e) => e.pageNumber === pageNumber); if (i !== -1) { const n = [...prev]; n[i] = full; return n; } return [...prev, full]; });
       setActiveEntry(full);
       setOutputTab("tsx");
@@ -2041,12 +2226,12 @@ export default function QuranProcessor() {
 
   const copy = () => {
     if (!activeEntry) return;
-    const tsx = generateTsx(activeEntry.parsed, activeEntry.searchOverrides, activeEntry.copyOverrides ?? {}, currentAnns, lineGap);
+    const tsx = generateTsx(activeEntry.parsed, activeEntry.searchOverrides, activeEntry.copyOverrides ?? {}, currentAnns, lineGap, activeEntry.pageAlign ?? "justify", activeEntry.wordGap ?? 2);
     navigator.clipboard.writeText(tsx).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
   };
   const download = () => {
     if (!activeEntry) return;
-    dl(generateTsx(activeEntry.parsed, activeEntry.searchOverrides, activeEntry.copyOverrides ?? {}, currentAnns, lineGap), `page${activeEntry.pageNumber}.tsx`);
+    dl(generateTsx(activeEntry.parsed, activeEntry.searchOverrides, activeEntry.copyOverrides ?? {}, currentAnns, lineGap, activeEntry.pageAlign ?? "justify", activeEntry.wordGap ?? 2), `page${activeEntry.pageNumber}.tsx`);
   };
   const exportManager = () => {
     if (history.length === 0) return;
@@ -2151,6 +2336,47 @@ export default function QuranProcessor() {
                 ))}
               </section>
             )}
+            {/* Backup section */}
+            <section style={S.card}>
+              <div style={S.cardTitle}>💾 Backup</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                <button style={{ ...S.exportBtn, width: "100%" }}
+                  onClick={() => exportBackup({ history, allOffsets, allColors, annotations, lineGap, hizbCursor, lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP })}>
+                  ⬇️ Export backup
+                </button>
+                <button style={{ ...S.toggle, width: "100%", fontSize: 11 }}
+                  onClick={() => backupFileRef.current?.click()}>
+                  ⬆️ Import backup
+                </button>
+                <input ref={backupFileRef} type="file" accept=".json" style={{ display: "none" }}
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    if (!f) return;
+                    try {
+                      const restored = await importBackup(f);
+                      setHistory(restored.history);
+                      setAllOffsets(restored.allOffsets);
+                      setAllColors(restored.allColors);
+                      setAnnotations(restored.annotations);
+                      setLineGap(restored.lineGap);
+                      setHizbCursor(restored.hizbCursor);
+                      setSvgoFP(restored.svgoFloatPrec);
+                      setSvgoMP(restored.svgoMultipass);
+                      saveAppState(restored);
+                      setBackupError(null);
+                      alert("✅ تم استيراد النسخة الاحتياطية بنجاح");
+                    } catch (err: any) {
+                      setBackupError(err.message);
+                    }
+                    e.target.value = "";
+                  }} />
+                {backupError && <div style={{ fontSize: 9, color: "#f87171" }}>{backupError}</div>}
+                <div style={{ fontSize: 9, color: "#4b5563", lineHeight: 1.5 }}>
+                  يحفظ: {history.length} صفحة، الإزاحات، الألوان، التفسيرات، الإعدادات
+                </div>
+              </div>
+            </section>
+
             <button style={{ ...S.toggle, fontSize: 10, color: "#f87171", border: "1px solid #f8717130" }} onClick={clearAll}>🗑️ Clear all</button>
           </aside>
 
@@ -2203,7 +2429,7 @@ export default function QuranProcessor() {
                   <button style={S.actBtn} onClick={copy}>{copied ? "✅" : "📋"}</button>
                   <button style={S.actBtn} onClick={download}>💾</button>
                 </div>
-                {outputTab === "tsx" && <pre style={S.pre}>{generateTsx(activeEntry.parsed, activeEntry.searchOverrides, activeEntry.copyOverrides ?? {}, currentAnns, lineGap)}</pre>}
+                {outputTab === "tsx" && <pre style={S.pre}>{generateTsx(activeEntry.parsed, activeEntry.searchOverrides, activeEntry.copyOverrides ?? {}, currentAnns, lineGap, activeEntry.pageAlign ?? "justify", activeEntry.wordGap ?? 2)}</pre>}
                 {outputTab === "summary" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                     {activeEntry.parsed.hizbMarks.length > 0 && (
@@ -2243,6 +2469,8 @@ export default function QuranProcessor() {
                     colors={currentColors} onColorChange={handleColorChange}
                     annotations={currentAnns} onAnnotationSave={handleAnnSave} onAnnotationDelete={handleAnnDelete}
                     lineGap={lineGap} onLineGapChange={setLineGap}
+                    pageAlign={activeEntry.pageAlign ?? "justify"} onPageAlignChange={handlePageAlignChange}
+                    wordGap={activeEntry.wordGap ?? 2} onWordGapChange={handleWordGapChange}
                   />
                 )}
                 {outputTab === "apis" && (
@@ -2306,6 +2534,8 @@ export default function QuranProcessor() {
                 colors={currentColors} onColorChange={handleColorChange}
                 annotations={currentAnns} onAnnotationSave={handleAnnSave} onAnnotationDelete={handleAnnDelete}
                 lineGap={lineGap} onLineGapChange={setLineGap}
+                pageAlign={activeEntry.pageAlign ?? "justify"} onPageAlignChange={handlePageAlignChange}
+                wordGap={activeEntry.wordGap ?? 2} onWordGapChange={handleWordGapChange}
               />
             )}
           </section>
@@ -2318,7 +2548,7 @@ export default function QuranProcessor() {
           <section style={S.card}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
               <div style={S.cardTitle}>📋 Manager</div>
-              <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 {Object.values(allOffsets).some((om) => Object.values(om).some((o) => o.x !== 0 || o.y !== 0)) && (
                   <button style={S.exportBtn} onClick={() => {
                     const all = history.map((e) => { const { lineGroups } = buildWordMetas(e.parsed, 60); return generateOffsetCss(allOffsets[e.id] ?? {}, e.pageNumber, e.surahNumbers, lineGroups, lineGap); }).join("\n\n");
@@ -2326,6 +2556,53 @@ export default function QuranProcessor() {
                   }}>💾 All CSS</button>
                 )}
                 <button style={S.exportBtn} onClick={exportManager} disabled={history.length === 0}>📦 MushafManager.tsx</button>
+                <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#3b82f6,#1d4ed8)" }}
+                  disabled={history.length === 0}
+                  onClick={async () => {
+                    const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+                    try {
+                      const JZ = await loadJSZip();
+                      const zip = new JZ();
+                      const pagesDir = zip.folder("pages");
+                      const cssDir   = zip.folder("css");
+                      for (const e of sorted) {
+                        const tsx = generateTsx(e.parsed, e.searchOverrides, e.copyOverrides ?? {}, annotations[e.id] ?? {}, lineGap, e.pageAlign ?? "justify", e.wordGap ?? 2);
+                        pagesDir.file(`Page${e.pageNumber}.tsx`, tsx);
+                      }
+                      const allCssParts: string[] = [];
+                      for (const e of sorted) {
+                        const { lineGroups } = buildWordMetas(e.parsed, 60);
+                        const css = generateOffsetCss(allOffsets[e.id] ?? {}, e.pageNumber, e.surahNumbers, lineGroups, lineGap);
+                        cssDir.file(`page${e.pageNumber}_offsets.css`, css);
+                        allCssParts.push(css);
+                      }
+                      cssDir.file("mushaf_offsets.css", allCssParts.join("\n\n"));
+                      zip.file("MushafManager.tsx", generateMushafManager(history, allOffsets, lineGap));
+                      zip.file("backup.json", JSON.stringify({ history, allOffsets, allColors, annotations, lineGap, hizbCursor }, null, 2));
+                      zip.file("README.txt",
+                        "Quran Processor Export\n======================\n\n" +
+                        `Pages: ${sorted.map((e) => e.pageNumber).join(", ")}\n` +
+                        `Exported: ${new Date().toISOString()}\n\n` +
+                        "  pages/Page{N}.tsx       - page components\n" +
+                        "  css/page{N}_offsets.css - per-page offsets\n" +
+                        "  css/mushaf_offsets.css  - all offsets\n" +
+                        "  MushafManager.tsx       - main component\n" +
+                        "  backup.json             - full state backup\n"
+                      );
+                      const blob = await zip.generateAsync({ type: "blob" });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      const dt = new Date().toISOString().slice(0, 10);
+                      a.download = `quran-mushaf-${dt}.zip`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    } catch (err: any) {
+                      alert("ZIP export failed: " + err.message);
+                    }
+                  }}>
+                  📦 Export ZIP Bundle
+                </button>
               </div>
             </div>
             {history.length === 0 ? <div style={{ color: "#4b5563", textAlign: "center", padding: "30px 0" }}>No pages yet.</div> : (
@@ -2348,13 +2625,14 @@ export default function QuranProcessor() {
                             <span>{kb(e.parsed.compressedBytes)}KB</span>
                             {oc > 0 && <span style={{ color: "#c9a96e" }}>{oc} offsets</span>}
                             {ac > 0 && <span style={{ color: "#10b981" }}>{ac} ann.</span>}
+                            {e.parsed.hasSajda && <span style={{ color: "#4ade80" }}>◆سجدة</span>}
                             {e.parsed.hizbMarks.map((h, i) => <span key={i} style={{ color: "#c9a96e" }}>{h.symbol}{h.positionId.split("_")[3] ?? ""}</span>)}
                           </div>
                         </div>
                         <div style={{ display: "flex", gap: 5 }}>
                           <button style={S.actBtn} onClick={() => { setActiveEntry(e); setView("previewer"); }}>🔍</button>
                           {oc > 0 && <button style={{ ...S.actBtn, color: "#c9a96e" }} onClick={() => dl(css, `page${e.pageNumber}_offsets.css`)}>CSS</button>}
-                          <button style={S.actBtn} onClick={() => dl(generateTsx(e.parsed, e.searchOverrides, e.copyOverrides ?? {}, annotations[e.id] ?? {}, lineGap), `page${e.pageNumber}.tsx`)}>TSX</button>
+                          <button style={S.actBtn} onClick={() => dl(generateTsx(e.parsed, e.searchOverrides, e.copyOverrides ?? {}, annotations[e.id] ?? {}, lineGap, e.pageAlign ?? "justify", e.wordGap ?? 2), `page${e.pageNumber}.tsx`)}>TSX</button>
                         </div>
                       </div>
                     );
