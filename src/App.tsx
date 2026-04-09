@@ -21,7 +21,7 @@ function loadJSZip(): Promise<any> {
 // CONSTANTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-const STORAGE_KEY = "qproc_v13";
+const STORAGE_KEY = "qproc_v14"; // legacy localStorage key
 
 // ── External APIs ─────────────────────────────────────────────────────────────
 // Quran.com API v4 — tafsir, translations, metadata (no auth needed for basic reads)
@@ -55,18 +55,10 @@ const DEFAULT_TAFSIR = "ibn_kathir";
 // Hizb markers — fraction = what fraction of ONE hizb this mark represents
 // 60 hizbs total, each hizb = 4 ربع = 8 ثمن
 const HIZB_MARKERS: Record<string, { label: string; fraction: number; symbol: string }> = {
-  "ثُمُنٌ": { label: "ثمن", fraction: 0.125, symbol: "⅛" },
-  "ثمن":   { label: "ثمن", fraction: 0.125, symbol: "⅛" },
   "®":     { label: "ثمن", fraction: 0.125, symbol: "⅛" },
-  "رُبْعٌ": { label: "ربع", fraction: 0.25,  symbol: "¼" },
-  "ربع":   { label: "ربع", fraction: 0.25,  symbol: "¼" },
-  "©":     { label: "ربع", fraction: 0.25,  symbol: "¼" },
-  "نِصْفٌ": { label: "نصف", fraction: 0.5,   symbol: "½" },
-  "نصف":   { label: "نصف", fraction: 0.5,   symbol: "½" },
-  "¥":     { label: "نصف", fraction: 0.5,   symbol: "½" },
-  "حِزْبٌ": { label: "حزب", fraction: 1,     symbol: "◉" },
-  "حزب":   { label: "حزب", fraction: 1,     symbol: "◉" },
-  "¤":     { label: "حزب", fraction: 1,     symbol: "◉" },
+  "©":     { label: "ربع", fraction: 0.125,  symbol: "¼" },
+  "¥":     { label: "نصف", fraction: 0.125,   symbol: "½" },
+  "¤":     { label: "حزب", fraction: .125,     symbol: "◉" },
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -171,7 +163,7 @@ interface ImportItem {
 }
 
 type Step     = "idle" | "parsing" | "compressing" | "generating" | "done" | "error";
-type MainView = "processor" | "import" | "history" | "previewer" | "manager";
+type MainView = "processor" | "import" | "history" | "previewer" | "manager" | "mapping";
 
 interface AppState {
   history:          HistoryEntry[];
@@ -414,18 +406,33 @@ function parseQuranHtml(
       const continuesFromPrev =
         ayahs.length === 0 && !words[0].isAyahMarker &&
         !words.some((w) => w.ayahNumber !== null && w.ayahNumber === aid);
-      // Get the per-surah ayah number from the ayah marker word (an_N class)
-      const markerWord = words.find((w) => w.isAyahMarker && w.ayahNumber !== null);
-      // Also check non-marker words that have an_N class (some sources put an_ on content words)
-      const anyWordWithAyahNum = words.find((w) => w.ayahNumber !== null && w.ayahNumber > 0);
-      // If this ayah has NO marker on this page (continues from prev page),
-      // ayahNumber is unknown — we mark it so we can skip copyData matching.
-      // We use the anyWordWithAyahNum fallback which gets the right value
-      // from content words that carry the an_N class.
-      const ayahNumRaw = markerWord?.ayahNumber ?? anyWordWithAyahNum?.ayahNumber ?? null;
-      const ayahNum = ayahNumRaw ?? 0;  // 0 = unknown (continues from prev page)
+      // Get per-surah ayah number from: marker word → any word with an_N class
+      const markerWord  = words.find((w) => w.isAyahMarker && w.ayahNumber !== null);
+      const contentWord = words.find((w) => !w.isAyahMarker && w.ayahNumber !== null && w.ayahNumber > 0);
+      const ayahNumRaw  = markerWord?.ayahNumber ?? contentWord?.ayahNumber ?? null;
+      // null = truly unknown (page starts mid-ayah, marker was on prev page)
+      // Will be resolved in second pass below using next ayah's number - 1
+      const ayahNum = ayahNumRaw ?? -1;  // -1 = needs resolution
       ayahs.push({ aid, ayahNum, surahNumber: sn, words, isComplete: hasMarker, continuesFromPrev });
     }
+
+    // Second pass: resolve ayahNum=-1 (continuing-from-prev ayahs)
+    // Rule: if ayah N has ayahNum=-1 and ayah N+1 has a known ayahNum K,
+    //       then ayah N's ayahNum = K - 1.
+    // This covers: page starts with last part of ayah 5, then shows 6,7,8...
+    //              → the continuing ayah gets ayahNum = 5.
+    for (let i = 0; i < ayahs.length; i++) {
+      if (ayahs[i].ayahNum === -1) {
+        if (i + 1 < ayahs.length && ayahs[i + 1].ayahNum > 0) {
+          // Next ayah is known: this one = next - 1
+          ayahs[i] = { ...ayahs[i], ayahNum: ayahs[i + 1].ayahNum - 1 };
+        } else {
+          // Can't determine: leave as 0 (will show as "?" in UI)
+          ayahs[i] = { ...ayahs[i], ayahNum: 0 };
+        }
+      }
+    }
+
     segments.push({ surahNumber: sn, surahTitle: seg.surahTitle, ayahs });
   }
 
@@ -483,13 +490,57 @@ function generateTsx(
 
   const segmentsCode = segments.map((seg) => {
     const ayahsCode = seg.ayahs.map((a) => {
-      const textDataAuto     = a.words.filter((w) => !w.isAyahMarker).map((w) => w.dataTxt).filter(Boolean).join(" ");
-      const searchDataAuto   = a.words.filter((w) => !w.isAyahMarker).map((w) => w.searchTxtAuto).filter(Boolean).join(" ");
-      // Use per-surah ayahNum (standard numbering) as the match key
-      // This matches the (1),(2)... numbers in clean text input
+      const contentWords     = a.words.filter((w) => !w.isAyahMarker);
+      const textDataAuto     = contentWords.map((w) => w.dataTxt).filter(Boolean).join(" ");
+      const searchDataAuto   = contentWords.map((w) => w.searchTxtAuto).filter(Boolean).join(" ");
       const overrideKey      = `${seg.surahNumber}:${a.ayahNum}`;
       const searchDataManual = searchOverrides[overrideKey] ?? "";
       const copyDataManual   = (copyOverrides ?? {})[overrideKey] ?? "";
+
+      // Compute per-word copyData distribution
+      // Split copyData by whitespace → assign word-by-word to SVG content words
+      const copyTokens = copyDataManual.trim() ? copyDataManual.trim().split(/\s+/) : [];
+      const svgWordCount = contentWords.length;
+      const copyWordCount = copyTokens.length;
+      // Determine if this page has the start/end of the ayah
+      const isCopyStart    = !a.continuesFromPrev;
+      const isCopyEnd      = a.isComplete;
+      const isCopyComplete = isCopyStart && isCopyEnd;
+      // The part of copyData visible on this page
+      // If continuesFromPrev: page shows the TAIL of the ayah
+      // If !isComplete: page shows the HEAD of the ayah
+      let copyDataPart = copyDataManual;
+      const copyWords: string[] = [];
+      if (copyTokens.length > 0) {
+        if (isCopyComplete) {
+          // Full ayah on one page: match 1:1
+          for (let wi = 0; wi < svgWordCount; wi++) {
+            copyWords.push(copyTokens[wi] ?? "");
+          }
+          copyDataPart = copyDataManual;
+        } else if (isCopyStart && !isCopyEnd) {
+          // Ayah starts here, continues to next page
+          // Assign first N tokens to the SVG words on this page
+          for (let wi = 0; wi < svgWordCount; wi++) {
+            copyWords.push(copyTokens[wi] ?? "");
+          }
+          copyDataPart = copyTokens.slice(0, svgWordCount).join(" ");
+        } else if (!isCopyStart && isCopyEnd) {
+          // Ayah started on prev page, ends here
+          // The LAST N tokens correspond to words on this page
+          const offset = Math.max(0, copyWordCount - svgWordCount);
+          for (let wi = 0; wi < svgWordCount; wi++) {
+            copyWords.push(copyTokens[offset + wi] ?? "");
+          }
+          copyDataPart = copyTokens.slice(offset).join(" ");
+        } else {
+          // Middle of ayah — can't determine which tokens are here
+          for (let wi = 0; wi < svgWordCount; wi++) copyWords.push("");
+          copyDataPart = "";
+        }
+      } else {
+        for (let wi = 0; wi < svgWordCount; wi++) copyWords.push("");
+      }
       const ayahKey  = `ayah_${seg.surahNumber}_${a.aid}`;
       const ayahAnns = Object.values(entryAnnotations).filter((ann) => ann.targetKey === ayahKey);
       const tafsirStr = ayahAnns.filter((a) => a.type === "tafsir").length > 0
@@ -505,7 +556,10 @@ function generateTsx(
         `      textData: ${JSON.stringify(textDataAuto)},`,
         `      searchDataAuto: ${JSON.stringify(searchDataAuto)},`,
         `      searchDataManual: ${JSON.stringify(searchDataManual)},`,
-        `      copyData: ${JSON.stringify(copyDataManual)}${tafsirStr}${riwayaStr},`,
+        `      copyData: ${JSON.stringify(copyDataManual)},`,
+        `      copyDataPart: ${JSON.stringify(copyDataPart)},`,
+        `      copyWords: ${JSON.stringify(copyWords)},`,
+        `      isCopyComplete: ${isCopyComplete}, isCopyStart: ${isCopyStart}, isCopyEnd: ${isCopyEnd}${tafsirStr}${riwayaStr},`,
         `    }`,
       ].join("\n");
     }).join(",\n");
@@ -553,6 +607,7 @@ export interface WordData {
 
 export interface AyahData {
   ayahId: number;
+  ayahNum: number;
   surahNumber: number;
   pageNumber: number;
   isComplete: boolean;
@@ -560,7 +615,13 @@ export interface AyahData {
   textData: string;          // as-is from source (display)
   searchDataAuto: string;    // auto-normalized for search
   searchDataManual: string;  // user override for search
-  copyData: string;          // clean copy text (from Quran source, for clipboard/docx/pdf)
+  copyData: string;          // clean copy text (full ayah)
+  copyDataPart: string;      // the PART of copyData on this page (may be partial)
+  // word-level copyData: index matches non-marker words in this ayah on this page
+  copyWords: string[];       // per-word clean text (empty string if word not in clean text)
+  isCopyComplete: boolean;   // all words of ayah are on this page
+  isCopyStart: boolean;      // this page has the START of the ayah (false = continues from prev)
+  isCopyEnd: boolean;        // this page has the END of the ayah (false = continues to next)
   tafsir?: { title: string; body: string; source: string }[];
   riwaya?: { title: string; body: string; source: string }[];
 }
@@ -606,7 +667,9 @@ function Word({ id, dataTxt, isAyahMarker, ayahNumber, hizbMark, tafsir, riwaya,
 function Line({ lineIndex, pageNumber, words }: LineData) {
   return (
     <div className="qline" data-line={lineIndex} data-page={pageNumber}
-      style={{ marginBottom: LINE_GAP_PX }}>
+      style={{ marginBottom: LINE_GAP_PX, display: "flex", flexDirection: "row-reverse",
+               justifyContent: PAGE_ALIGN === "justify" ? "space-between" : PAGE_ALIGN,
+               gap: PAGE_ALIGN !== "justify" ? WORD_GAP_PX : 0 }}>
       {words.map((w) => <Word key={w.id} {...w} />)}
     </div>
   );
@@ -614,7 +677,8 @@ function Line({ lineIndex, pageNumber, words }: LineData) {
 
 export function Page${pageNumber}() {
   return (
-    <div className="qpage" id={\`page_${pageNumber}\`} data-page={${pageNumber}} data-hizb-start="${hizbAtStart}">
+    <div className="qpage" id={\`page_${pageNumber}\`} data-page={${pageNumber}} data-hizb-start="${hizbAtStart}"
+      style={{ fontFamily: "AALMAGHRIBI, serif" }}>
       {segments.map((seg) =>
         seg.surahTitle
           ? <div key={seg.surahNumber} className="qsurah-title" data-surah={seg.surahNumber}>{seg.surahTitle}</div>
@@ -788,81 +852,259 @@ function generateOffsetCss(offsets: OffsetMap, pageNumber: number, surahNumbers:
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// LOCAL STORAGE  — fixed: serialize carefully, never save mid-load
+// STORAGE: IndexedDB for pages (unlimited) + localStorage for settings
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// IndexedDB: "qproc_db" / store "pages" — each record = one HistoryEntry
+// localStorage: "qproc_settings_v14" — everything except history[]
+//
+// This allows 600+ pages (each with full SVG data) without hitting limits.
 // ══════════════════════════════════════════════════════════════════════════════
 
+const IDB_NAME    = "qproc_db";
+const IDB_VERSION = 1;
+const IDB_STORE   = "pages";
+const SETTINGS_KEY = "qproc_settings_v14";
+
+// ── IndexedDB helpers ────────────────────────────────────────────────────────
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: "id" });
+      }
+    };
+    req.onsuccess = (e) => resolve((e.target as IDBOpenDBRequest).result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function idbGetAll(): Promise<HistoryEntry[]> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).getAll();
+    req.onsuccess = () => resolve((req.result ?? []) as HistoryEntry[]);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function idbPut(entry: HistoryEntry): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(IDB_STORE, "readwrite");
+    const req = tx.objectStore(IDB_STORE).put(entry);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function idbDelete(id: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(IDB_STORE, "readwrite");
+    const req = tx.objectStore(IDB_STORE).delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function idbClear(): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(IDB_STORE, "readwrite");
+    const req = tx.objectStore(IDB_STORE).clear();
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function idbPutMany(entries: HistoryEntry[]): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    const store = tx.objectStore(IDB_STORE);
+    for (const e of entries) store.put(e);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+// ── Settings (localStorage, lightweight) ─────────────────────────────────────
+
+interface Settings {
+  allOffsets:    Record<string, OffsetMap>;
+  allColors:     Record<string, ColorMap>;
+  annotations:   AnnotationStore;
+  lineGap:       number;
+  hizbCursor:    number;
+  lastPageNumber: number;
+  svgoFloatPrec: number;
+  svgoMultipass: boolean;
+}
+
+function defaultSettings(): Settings {
+  return { allOffsets: {}, allColors: {}, annotations: {}, lineGap: 4, hizbCursor: 0, lastPageNumber: 1, svgoFloatPrec: 3, svgoMultipass: true };
+}
+
+function loadSettings(): Settings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return defaultSettings();
+    const p = JSON.parse(raw) as Partial<Settings>;
+    const d = defaultSettings();
+    return {
+      allOffsets:     p.allOffsets  ?? d.allOffsets,
+      allColors:      p.allColors   ?? d.allColors,
+      annotations:    p.annotations ?? d.annotations,
+      lineGap:        typeof p.lineGap === "number"      ? p.lineGap      : d.lineGap,
+      hizbCursor:     typeof p.hizbCursor === "number"   ? p.hizbCursor   : d.hizbCursor,
+      lastPageNumber: typeof p.lastPageNumber === "number"? p.lastPageNumber: d.lastPageNumber,
+      svgoFloatPrec:  typeof p.svgoFloatPrec === "number"? p.svgoFloatPrec : d.svgoFloatPrec,
+      svgoMultipass:  typeof p.svgoMultipass === "boolean"? p.svgoMultipass: d.svgoMultipass,
+    };
+  } catch { return defaultSettings(); }
+}
+
+let _settingsTimer: ReturnType<typeof setTimeout> | null = null;
+function saveSettings(s: Settings) {
+  if (_settingsTimer) clearTimeout(_settingsTimer);
+  _settingsTimer = setTimeout(() => {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+    catch (e) { console.warn("Settings save failed:", e); }
+  }, 300);
+}
+
+// ── Keep AppState type for backup compatibility ───────────────────────────────
 function defaultState(): AppState {
   return { history: [], allOffsets: {}, allColors: {}, annotations: {}, lineGap: 4, hizbCursor: 0, lastPageNumber: 1, svgoFloatPrec: 3, svgoMultipass: true };
 }
 
-function loadAppState(): AppState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultState();
-    const p = JSON.parse(raw) as Partial<AppState>;
-    const d = defaultState();
-    return {
-      history:        Array.isArray(p.history)     ? p.history        : d.history,
-      allOffsets:     p.allOffsets  ?? d.allOffsets,
-      allColors:      p.allColors   ?? d.allColors,
-      annotations:    p.annotations ?? d.annotations,
-      lineGap:        typeof p.lineGap === "number"     ? p.lineGap     : d.lineGap,
-      hizbCursor:     typeof p.hizbCursor === "number"  ? p.hizbCursor  : d.hizbCursor,
-      lastPageNumber: typeof p.lastPageNumber === "number" ? p.lastPageNumber : d.lastPageNumber,
-      svgoFloatPrec:  typeof p.svgoFloatPrec === "number" ? p.svgoFloatPrec  : d.svgoFloatPrec,
-      svgoMultipass:  typeof p.svgoMultipass === "boolean" ? p.svgoMultipass : d.svgoMultipass,
-    };
-  } catch { return defaultState(); }
-}
-
-// Debounced save — avoid hammering localStorage on rapid state changes
-let _saveTimer: ReturnType<typeof setTimeout> | null = null;
-function saveAppState(state: AppState) {
-  if (_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(() => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { console.warn("localStorage save failed:", e); }
-  }, 300);
-}
+function loadAppState(): AppState { return defaultState(); }  // legacy — not used
+function saveAppState(_state: AppState) {}  // legacy — not used
 
 // ══════════════════════════════════════════════════════════════════════════════
 // BACKUP — Export / Import full app state as JSON
 // ══════════════════════════════════════════════════════════════════════════════
 
-const BACKUP_VERSION = 2;
+const BACKUP_VERSION = 3;
 
-function exportBackup(state: AppState): void {
-  const payload = { _version: BACKUP_VERSION, _date: new Date().toISOString(), ...state };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `quran-processor-backup-${new Date().toISOString().slice(0, 10)}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+// Export backup as JSON — streams page data to avoid string length limits
+// For large datasets (100+ pages), the file may be several hundred MB
+// Chunk size for backup splitting
+const BACKUP_CHUNK_SIZE = 30; // pages per file
+
+async function exportBackup(
+  history: HistoryEntry[],
+  settings: Settings,
+  onProgress?: (done: number, total: number) => void,
+): Promise<void> {
+  const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+  const date = new Date().toISOString().slice(0, 10);
+  const totalPages = sorted.length;
+
+  // Helper: download a blob as a file
+  const dlBlob = (blob: Blob, name: string) => new Promise<void>((resolve) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); resolve(); }, 2000);
+  });
+
+  if (totalPages <= BACKUP_CHUNK_SIZE) {
+    // Small backup: single file
+    const payload = {
+      _version: BACKUP_VERSION, _date: new Date().toISOString(),
+      _chunks: 1, _chunk: 1,
+      settings, pages: sorted,
+    };
+    const str = JSON.stringify(payload);
+    const blob = new Blob([str], { type: "application/json;charset=utf-8" });
+    await dlBlob(blob, `quran-backup-${date}-${totalPages}pages.json`);
+    onProgress?.(totalPages, totalPages);
+    return;
+  }
+
+  // Large backup: split into chunks of BACKUP_CHUNK_SIZE pages each
+  const chunks: HistoryEntry[][] = [];
+  for (let i = 0; i < sorted.length; i += BACKUP_CHUNK_SIZE) {
+    chunks.push(sorted.slice(i, i + BACKUP_CHUNK_SIZE));
+  }
+
+  // First file: meta + settings + first chunk
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    const isFirst = ci === 0;
+    const payload: any = {
+      _version: BACKUP_VERSION, _date: new Date().toISOString(),
+      _chunks: chunks.length, _chunk: ci + 1,
+      _totalPages: totalPages,
+    };
+    if (isFirst) payload.settings = settings;
+    payload.pages = chunk;
+
+    // Build string in pieces to avoid single huge allocation
+    const str = JSON.stringify(payload);
+    const blob = new Blob([str], { type: "application/json;charset=utf-8" });
+    const fileName = `quran-backup-${date}-part${ci + 1}of${chunks.length}.json`;
+    await dlBlob(blob, fileName);
+
+    const done = Math.min((ci + 1) * BACKUP_CHUNK_SIZE, totalPages);
+    onProgress?.(done, totalPages);
+
+    // Small pause between downloads so browser doesn't block
+    await new Promise<void>((r) => setTimeout(r, 500));
+  }
 }
 
-function importBackup(file: File): Promise<AppState> {
+// Import backup — handles single file or chunked backup
+// Returns pages[] and settings (settings only in first chunk)
+function importBackup(file: File): Promise<{ pages: HistoryEntry[]; settings: Settings; isChunk: boolean; chunkInfo?: string }> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const raw = JSON.parse(e.target?.result as string);
-        // Validate and merge with defaults
-        const d = defaultState();
-        const restored: AppState = {
-          history:        Array.isArray(raw.history)  ? raw.history  : d.history,
-          allOffsets:     raw.allOffsets  ?? d.allOffsets,
-          allColors:      raw.allColors   ?? d.allColors,
-          annotations:    raw.annotations ?? d.annotations,
-          lineGap:        typeof raw.lineGap === "number" ? raw.lineGap : d.lineGap,
-          hizbCursor:     typeof raw.hizbCursor === "number" ? raw.hizbCursor : d.hizbCursor,
-          lastPageNumber: raw.lastPageNumber ?? d.lastPageNumber,
-          svgoFloatPrec:  raw.svgoFloatPrec  ?? d.svgoFloatPrec,
-          svgoMultipass:  raw.svgoMultipass  ?? d.svgoMultipass,
+        const d = defaultSettings();
+
+        const extractSettings = (src: any): Settings => {
+          const s = (src.settings ?? src) as Partial<Settings>;
+          return {
+            allOffsets:     s.allOffsets  ?? d.allOffsets,
+            allColors:      s.allColors   ?? d.allColors,
+            annotations:    s.annotations ?? d.annotations,
+            lineGap:        typeof s.lineGap === "number"        ? s.lineGap        : d.lineGap,
+            hizbCursor:     typeof s.hizbCursor === "number"     ? s.hizbCursor     : d.hizbCursor,
+            lastPageNumber: s.lastPageNumber ?? d.lastPageNumber,
+            svgoFloatPrec:  s.svgoFloatPrec  ?? d.svgoFloatPrec,
+            svgoMultipass:  s.svgoMultipass  ?? d.svgoMultipass,
+          };
         };
-        resolve(restored);
+
+        // V3+ single or chunked
+        if (raw._version >= 3 && Array.isArray(raw.pages)) {
+          const isChunk = (raw._chunks ?? 1) > 1;
+          const chunkInfo = isChunk ? `جزء ${raw._chunk} من ${raw._chunks}` : undefined;
+          resolve({
+            pages: raw.pages as HistoryEntry[],
+            settings: raw.settings ? extractSettings(raw) : d,
+            isChunk, chunkInfo,
+          });
+          return;
+        }
+
+        // V1/V2 legacy
+        if (Array.isArray(raw.history)) {
+          resolve({ pages: raw.history as HistoryEntry[], settings: extractSettings(raw), isChunk: false });
+          return;
+        }
+
+        reject(new Error("تنسيق غير معروف — تأكد أن الملف صادر من هذا التطبيق"));
       } catch (err: any) {
-        reject(new Error("ملف النسخة الاحتياطية تالف أو غير صالح: " + err.message));
+        reject(new Error("ملف تالف أو غير صالح: " + err.message));
       }
     };
     reader.onerror = () => reject(new Error("فشل قراءة الملف"));
@@ -973,41 +1215,65 @@ async function processOnePage(
 // GET /tafseer/{tafseer_id}/{sura_number}/{start_ayah}/{end_ayah}
 // Returns array: [{ ayah_number: N, text: "..." }, ...]
 // Tries direct first, then CORS proxies
+// Fetch tafsir from api.quran-tafseer.com
+// Docs: http://api.quran-tafseer.com/en/docs/
+// Endpoint: GET /tafseer/{tafseer_id}/{sura}/{start_ayah}/{end_ayah}
+// Response: array of { tafseer_id, tafseer_name, ayah_url, ayah_number, text }
+// The API supports CORS but may be blocked from localhost.
+// We try the direct URL first, then fall through 3 CORS proxies.
 async function fetchTafsirRange(
   surah: number, tafsirId: number, startAyah: number, endAyah: number
 ): Promise<Record<number, string>> {
-  const directUrl = `${QURAN_TAFSEER_API}/${tafsirId}/${surah}/${startAyah}/${endAyah}`;
+  // Both http and https versions — some proxies prefer one over the other
+  const url = `https://api.quran-tafseer.com/tafseer/${tafsirId}/${surah}/${startAyah}/${endAyah}`;
+  const urlHttp = `http://api.quran-tafseer.com/tafseer/${tafsirId}/${surah}/${startAyah}/${endAyah}`;
 
-  const proxies = [
-    () => fetch(directUrl, { headers: { Accept: "application/json" } }),
-    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`),
-    () => fetch(`https://corsproxy.io/?${encodeURIComponent(directUrl)}`),
+  const attempts: Array<() => Promise<Response>> = [
+    // 1. Direct HTTPS (works if API has CORS headers + you're on https or localhost)
+    () => fetch(url, { headers: { Accept: "application/json", Origin: window.location.origin } }),
+    // 2. allorigins.win — fetches server-side and adds CORS headers
+    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`),
+    // 3. corsproxy.io
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`),
+    // 4. thingproxy (reliable for Arabic APIs)
+    () => fetch(`https://thingproxy.freeboard.io/fetch/${url}`),
+    // 5. HTTP version via allorigins
+    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(urlHttp)}`),
   ];
 
   let data: any = null;
-  let lastErr = "no response";
+  const errors: string[] = [];
 
-  for (const attempt of proxies) {
+  for (let i = 0; i < attempts.length; i++) {
     try {
-      const r = await attempt();
-      if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
+      const r = await attempts[i]();
+      if (!r.ok) { errors.push(`proxy${i}: HTTP ${r.status}`); continue; }
       const text = await r.text();
+      if (!text.trim()) { errors.push(`proxy${i}: empty`); continue; }
       const parsed = JSON.parse(text);
-      // Accept if array with ayah_number field OR single object
-      if (Array.isArray(parsed) && parsed.length > 0) { data = parsed; break; }
-      if (parsed?.ayah_number) { data = [parsed]; break; }
-      if (parsed?.text) { data = [{ ayah_number: startAyah, text: parsed.text }]; break; }
-      lastErr = "empty response";
-    } catch (e: any) { lastErr = e.message; }
+      // Validate response structure
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].ayah_number !== undefined) {
+        data = parsed; break;
+      }
+      if (parsed?.ayah_number !== undefined) { data = [parsed]; break; }
+      errors.push(`proxy${i}: unexpected shape: ${JSON.stringify(parsed).slice(0, 60)}`);
+    } catch (e: any) { errors.push(`proxy${i}: ${e.message}`); }
   }
 
-  if (!data) throw new Error(`فشل جلب التفسير: ${lastErr}`);
+  if (!data) {
+    throw new Error(
+      `فشل جلب التفسير للآيات ${surah}:${startAyah}-${endAyah}.
+` +
+      `الأخطاء: ${errors.join(" | ")}
+` +
+      `جرب فتح هذا الرابط في المتصفح: ${url}`
+    );
+  }
 
   const result: Record<number, string> = {};
   for (const item of data) {
     const num = parseInt(String(item.ayah_number ?? 0));
-    if (!isNaN(num) && num > 0) {
-      // Strip any HTML tags
+    if (!isNaN(num) && num >= startAyah && num <= endAyah) {
       result[num] = String(item.text ?? "").replace(/<[^>]*>/g, "").trim();
     }
   }
@@ -1067,7 +1333,7 @@ function TafsirAudioPanel({
       // Group ayahs by surah, skip unknown (ayahNum=0 = continuing from prev page)
       const bySurah: Record<number, number[]> = {};
       for (const a of ayahs) {
-        if (a.ayahNum === 0) continue; // unknown — continuing ayah
+        if (a.ayahNum <= 0) continue; // truly unknown — skip
         if (!bySurah[a.surahNumber]) bySurah[a.surahNumber] = [];
         bySurah[a.surahNumber].push(a.ayahNum);
       }
@@ -1217,24 +1483,21 @@ function TafsirAudioPanel({
       </div>
 
       {tafsirError && (
-        <div style={S.errBanner}>
+        <div style={{ ...S.errBanner, whiteSpace: "pre-wrap", direction: "rtl" }}>
           ❌ {tafsirError}
-          <br />
-          <span style={{ fontSize: 10, color: "#f8717199" }}>
-            إذا كانت المشكلة في التفسير: يتم استخدام CORS proxy تلقائياً (allorigins.win).
-            إذا استمرت المشكلة تأكد من اتصال الإنترنت.
-          </span>
         </div>
       )}
 
       {/* Info note */}
       <div style={{ fontSize: 10, color: "#4b5563", lineHeight: 1.9, background: "#0f1117", border: "1px solid #1e2332", borderRadius: 6, padding: "8px 10px" }}>
-        <b style={{ color: "#9ca3af" }}>📖 التفسير:</b> api.quran-tafseer.com — يدعم {Object.keys(TAFSIR_SOURCES).length} مصادر عربية.<br />
-        للتحقق: افتح{" "}
+        <b style={{ color: "#9ca3af" }}>📖 التفسير:</b>{" "}
         <a href={`https://api.quran-tafseer.com/tafseer/${TAFSIR_SOURCES[tafsirSource].id}/1/1/7`}
-          target="_blank" rel="noreferrer"
-          style={{ color: "#7dd3fc" }}>هذا الرابط</a>{" "}
-        في المتصفح (يجب أن يُرجع JSON).
+          target="_blank" rel="noreferrer" style={{ color: "#7dd3fc" }}>
+          api.quran-tafseer.com
+        </a>{" "}
+        — يجرب 5 طرق تلقائياً. إذا فشل: افتح الرابط في متصفح جديد وتحقق أنه يُرجع JSON.
+        <br />
+        <span style={{ color: "#4b5563" }}>المصادر: {Object.values(TAFSIR_SOURCES).map(v => v.name).join(" · ")}</span>
         <br />
         <b style={{ color: "#9ca3af" }}>🎧 الصوت (ورش):</b> everyayah.com — اضغط ▶ مباشرة للتشغيل.
         إذا لم يعمل: <a href={warshAudioUrl(1, 1, warshReciter)} target="_blank" rel="noreferrer" style={{ color: "#7dd3fc" }}>اختبر الرابط</a>
@@ -1255,7 +1518,10 @@ function TafsirAudioPanel({
             <div key={key} style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "10px 12px" }}>
               {/* Header row */}
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                <span style={{ ...S.historyPageBadge, fontSize: 12 }}>{a.surahNumber}:{a.ayahNum}</span>
+                <span style={{ ...S.historyPageBadge, fontSize: 12 }}>
+                  {a.surahNumber}:{a.ayahNum > 0 ? a.ayahNum : "?"}
+                  {a.ayahNum === 0 && <span style={{ fontSize: 8, opacity: 0.6, marginLeft: 3 }}>متواصلة</span>}
+                </span>
                 <div style={{ flex: 1, fontSize: 13, color: "#e8e6e0", fontFamily: "serif", direction: "rtl", lineHeight: 1.7 }}>
                   {a.textData.slice(0, 120)}{a.textData.length > 120 ? "…" : ""}
                 </div>
@@ -1335,6 +1601,7 @@ function SvgChainPreviewer({
   lineGap, onLineGapChange,
   pageAlign, onPageAlignChange,
   wordGap, onWordGapChange,
+  onApplyGapToAll, onApplyWordGapToAll,
 }: {
   parsed: ParsedPage;
   selectedWordId: string | null;
@@ -1352,6 +1619,8 @@ function SvgChainPreviewer({
   onPageAlignChange: (v: HistoryEntry["pageAlign"]) => void;
   wordGap: number;
   onWordGapChange: (v: number) => void;
+  onApplyGapToAll?: (gap: number) => void;
+  onApplyWordGapToAll?: (gap: number) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerW, setContainerW] = useState(800);
@@ -1446,6 +1715,9 @@ function SvgChainPreviewer({
                 onChange={(e) => onLineGapChange(parseInt(e.target.value) || 0)}
                 style={{ ...SP.numInput, width: 54 }} />
               <span style={SP.dim}>px</span>
+              <button style={{ ...SP.smallBtn, fontSize: 9 }}
+                title="Apply this gap to ALL pages"
+                onClick={() => onApplyGapToAll?.(lineGap)}>all</button>
             </div>
 
             {/* Word width % — controls SVG container width relative to auto */}
@@ -1455,8 +1727,11 @@ function SvgChainPreviewer({
                 onChange={(e) => onWordGapChange(parseInt(e.target.value) || 0)}
                 style={{ ...SP.numInput, width: 54 }} />
               <span style={{ ...SP.dim, fontSize: 9, color: wordGap === 0 ? "#4b5563" : "#c9a96e" }}>
-                {wordGap === 0 ? "auto" : wordGap > 0 ? `+${wordGap}% wider` : `${wordGap}% narrower`}
+                {wordGap === 0 ? "auto" : wordGap > 0 ? `+${wordGap}%` : `${wordGap}%`}
               </span>
+              <button style={{ ...SP.smallBtn, fontSize: 9 }}
+                title="Apply this width to ALL pages"
+                onClick={() => onApplyWordGapToAll?.(wordGap)}>all</button>
             </div>
 
             {/* Page alignment — per page, saved into TSX */}
@@ -1696,6 +1971,92 @@ const SP: Record<string, React.CSSProperties> = {
 // BATCH IMPORT VIEW
 // ══════════════════════════════════════════════════════════════════════════════
 
+// ── Surah Range Quick-Fill component ─────────────────────────────────────────
+function RangeQuickFill({
+  items,
+  onApply,
+}: {
+  items: ImportItem[];
+  onApply: (patches: Array<{ pageNumber: number; surahInput: string }>) => void;
+}) {
+  const [rangeText, setRangeText] = useState("");
+  const [preview, setPreview]     = useState<Array<{ pageNumber: number; surahInput: string }>>([]);
+  const [error, setError]         = useState<string | null>(null);
+
+  const parseRanges = (text: string): Array<{ pageNumber: number; surahInput: string }> => {
+    const result: Array<{ pageNumber: number; surahInput: string }> = [];
+    // Split by whitespace or newline
+    const tokens = text.trim().split(/[\s;\n\r]+/).filter(Boolean); // commas are part of surah list like "2,3"
+    for (const token of tokens) {
+      // Format: pageRange:surah(s)
+      // pageRange: N or N-M
+      // surah(s): N or N,M,K
+      const match = token.match(/^(\d+)(?:-(\d+))?:(\d+(?:,\d+)*)$/);
+      if (!match) throw new Error(`تنسيق غير صحيح: "${token}"`);
+      const from    = parseInt(match[1]);
+      const to      = match[2] ? parseInt(match[2]) : from;
+      const surahs  = match[3]; // e.g. "2" or "2,3"
+      if (from > to) throw new Error(`نطاق خاطئ: ${from}-${to}`);
+      if (to - from > 300) throw new Error(`نطاق كبير جداً: ${from}-${to}`);
+      for (let p = from; p <= to; p++) {
+        result.push({ pageNumber: p, surahInput: surahs });
+      }
+    }
+    return result;
+  };
+
+  const handlePreview = () => {
+    try {
+      const patches = parseRanges(rangeText);
+      setPreview(patches);
+      setError(null);
+    } catch (e: any) { setError(e.message); setPreview([]); }
+  };
+
+  const handleApply = () => {
+    try {
+      const patches = parseRanges(rangeText);
+      onApply(patches);
+      setPreview([]);
+      setError(null);
+    } catch (e: any) { setError(e.message); }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <textarea
+        style={{ ...S.textarea, height: 70, direction: "ltr", fontFamily: "monospace", fontSize: 12 }}
+        value={rangeText}
+        onChange={(e) => setRangeText(e.target.value)}
+        placeholder={"1:1  2-45:2  46:2,3  47-70:3  71-90:4  ..."}
+      />
+      <div style={{ display: "flex", gap: 6 }}>
+        <button style={{ ...S.actBtn }} onClick={handlePreview} disabled={!rangeText.trim()}>
+          👁️ Preview ({preview.length > 0 ? `${preview.length} pages` : "?"})
+        </button>
+        <button style={{ ...S.exportBtn }} onClick={handleApply} disabled={!rangeText.trim()}>
+          ✅ Apply to Queue
+        </button>
+        {preview.length > 0 && (
+          <span style={{ fontSize: 10, color: "#4ade80", alignSelf: "center" }}>
+            → {preview.length} pages, surahs: {[...new Set(preview.map(p => p.surahInput))].join(" · ")}
+          </span>
+        )}
+      </div>
+      {error && <div style={{ fontSize: 10, color: "#f87171" }}>❌ {error}</div>}
+      {preview.length > 0 && preview.length <= 20 && (
+        <div style={{ fontSize: 9, color: "#6b7280", display: "flex", flexWrap: "wrap", gap: 3 }}>
+          {preview.map((p) => (
+            <span key={p.pageNumber} style={{ background: "#1e2332", borderRadius: 3, padding: "1px 5px" }}>
+              P{p.pageNumber}:{p.surahInput}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BatchImportView({
   onImportDone,
   hizbCursor,
@@ -1894,9 +2255,8 @@ function BatchImportView({
         if (Object.keys(globalCopyMap).length > 0) {
           for (const seg of entry.parsed.segments) {
             for (const a of seg.ayahs) {
-              // Use ayahNum (per-surah standard number) to match clean text (N) markers
+              if (a.ayahNum <= 0) continue; // truly unknown, skip
               const lookupKey = `${seg.surahNumber}:${a.ayahNum}`;
-              // Store under the same key so generateTsx can find it
               if (globalCopyMap[lookupKey]) copyOvr[lookupKey] = globalCopyMap[lookupKey];
             }
           }
@@ -1973,6 +2333,26 @@ function BatchImportView({
           ))}
         </div>
       )}
+
+      {/* Surah Range Quick-Fill */}
+      <div style={S.card}>
+        <div style={S.cardTitle}>⚡ Surah Range Quick-Fill</div>
+        <div style={{ fontSize: 10, color: "#6b7280", marginBottom: 8, lineHeight: 1.7 }}>
+          ضع سور الصفحات بسرعة بصيغة: <code style={S.ic}>pageRange:surah(s)</code><br />
+          <code style={S.ic}>1:1</code> صفحة 1 سورة 1 &nbsp;·&nbsp;
+          <code style={S.ic}>2-45:2</code> صفحات 2-45 سورة 2 &nbsp;·&nbsp;
+          <code style={S.ic}>46:2,3</code> صفحة 46 سور 2و3 &nbsp;·&nbsp;
+          <code style={S.ic}>47-70:3</code> صفحات 47-70 سورة 3<br />
+          <span style={{ color: "#c9a96e" }}>افصل بين المجموعات بمسافة أو سطر جديد.</span>
+        </div>
+        <RangeQuickFill items={items} onApply={(patches) => {
+          setItems((prev) => prev.map((it) => {
+            const p = patches.find((px) => px.pageNumber === it.pageNumber);
+            if (p) { setManualSurahIds((ms) => new Set([...ms, it.id])); return { ...it, surahInput: p.surahInput }; }
+            return it;
+          }));
+        }} />
+      </div>
 
       {/* Quran clean copy text — feeds copyData per ayah */}
       <div style={S.card}>
@@ -2080,8 +2460,244 @@ function HistoryPanel({ history, selectedId, onSelect, onRemove, onRename, onExp
 // MAIN APP
 // ══════════════════════════════════════════════════════════════════════════════
 
+// ══════════════════════════════════════════════════════════════════════════════
+// HAFS / WARSH MAPPING — Ayah number sync framework
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// The Quran has two major transmission traditions:
+// • Hafs (حفص عن عاصم)  — used by most digital services (Quran.com, EveryAyah)
+// • Warsh (ورش عن نافع) — used by Maghreb / this Mushaf
+//
+// The differences are:
+// 1. Some surahs have different ayah counts (e.g. Al-Baqara Hafs=286 Warsh=286 — same)
+//    but in total there are ~3 surahs with count differences
+// 2. The Basmalah: in Hafs it is NOT counted as ayah 1 of each surah
+//    In Warsh (Maghrebi riwaya) it IS counted as ayah 1 of each surah
+//    → Hafs: Fatiha 7 ayahs (1=الحمد); Warsh: 7 ayahs (1=Basmalah, 7=الحمد)
+//    Wait actually both count the same for Fatiha.
+//    The real difference: some surahs (Al-Anfal, At-Tawbah) and a few others.
+//
+// This component lets you:
+// 1. Define per-surah offset: Warsh ayah N = Hafs ayah (N + offset)
+// 2. Use this to fetch correct tafsir from Hafs-based APIs
+// 3. Export offline tafsir to JSON for embedding in the app
+//
+// Default mapping: most surahs 0 offset (same numbering in both)
+// Known differences (based on standard Warsh al-Azraq vs Hafs Shatibiyya):
+// Surah 9 (At-Tawbah): no Basmalah, counts the same
+// Most differences are 0 — the major difference is the Basmalah of Al-Fatiha
+// being counted as ayah 1 in Warsh (but also in Hafs for Fatiha)
+
+const DEFAULT_HAFS_WARSH_OFFSETS: Record<number, number> = {
+  // surahNumber: offset (Warsh_ayahNum - Hafs_ayahNum)
+  // 0 means same numbering, -1 means Warsh is 1 less than Hafs, etc.
+  // Fill in as you discover differences in your specific riwaya
+};
+
+function HafsWarshMapping({ history }: { history: HistoryEntry[] }) {
+  const [offsets, setOffsets] = useState<Record<number, number>>(() => {
+    try {
+      const s = localStorage.getItem("hafs_warsh_offsets_v1");
+      return s ? JSON.parse(s) : { ...DEFAULT_HAFS_WARSH_OFFSETS };
+    } catch { return { ...DEFAULT_HAFS_WARSH_OFFSETS }; }
+  });
+  const [fetchingTafsir, setFetchingTafsir] = useState(false);
+  const [offlineTafsir, setOfflineTafsir]   = useState<Record<string, string>>({});
+  const [tafsirSrc, setTafsirSrc]           = useState<keyof typeof TAFSIR_SOURCES>("ibn_kathir");
+  const [fetchProg, setFetchProg]           = useState({ done: 0, total: 0 });
+  const [fetchErr, setFetchErr]             = useState<string | null>(null);
+  const [editingSurah, setEditingSurah]     = useState<number | null>(null);
+  const [editVal, setEditVal]               = useState("");
+
+  // Get unique surahs from history
+  const allSurahs = [...new Set(history.flatMap(e => e.surahNumbers))].sort((a, b) => a - b);
+
+  const saveOffsets = (o: Record<number, number>) => {
+    setOffsets(o);
+    localStorage.setItem("hafs_warsh_offsets_v1", JSON.stringify(o));
+  };
+
+  // Convert Warsh ayah number to Hafs for API lookup
+  const warshToHafs = (surah: number, warshAyah: number): number => {
+    const offset = offsets[surah] ?? 0;
+    return warshAyah - offset; // Hafs = Warsh - offset
+  };
+
+  // Fetch tafsir for all pages using the mapping
+  const fetchAllOfflineTafsir = async () => {
+    setFetchingTafsir(true);
+    setFetchErr(null);
+    const result: Record<string, string> = { ...offlineTafsir };
+    const tafsirId = TAFSIR_SOURCES[tafsirSrc].id;
+
+    // Collect all unique surah:warshAyah pairs
+    const toFetch: Array<{ surah: number; warshAyah: number; hafsAyah: number }> = [];
+    for (const entry of history) {
+      for (const seg of entry.parsed.segments) {
+        for (const a of seg.ayahs) {
+          if (a.ayahNum <= 0) continue;
+          const key = `${seg.surahNumber}:${a.ayahNum}`;
+          if (!result[key]) {
+            toFetch.push({
+              surah: seg.surahNumber,
+              warshAyah: a.ayahNum,
+              hafsAyah: warshToHafs(seg.surahNumber, a.ayahNum),
+            });
+          }
+        }
+      }
+    }
+
+    // Deduplicate
+    const unique = toFetch.filter((item, i, arr) =>
+      arr.findIndex(x => x.surah === item.surah && x.warshAyah === item.warshAyah) === i
+    );
+
+    setFetchProg({ done: 0, total: unique.length });
+
+    // Group by surah for range fetching
+    const bySurah: Record<number, { warsh: number; hafs: number }[]> = {};
+    for (const item of unique) {
+      if (!bySurah[item.surah]) bySurah[item.surah] = [];
+      bySurah[item.surah].push({ warsh: item.warshAyah, hafs: item.hafsAyah });
+    }
+
+    let done = 0;
+    for (const [surahStr, pairs] of Object.entries(bySurah)) {
+      const surah = parseInt(surahStr);
+      // Sort by hafs ayah to use range endpoint
+      const sorted = [...pairs].sort((a, b) => a.hafs - b.hafs);
+      const minHafs = sorted[0].hafs;
+      const maxHafs = sorted[sorted.length - 1].hafs;
+      try {
+        const fetched = await fetchTafsirRange(surah, tafsirId, minHafs, maxHafs);
+        // Map fetched (hafs-keyed) back to warsh keys
+        for (const pair of sorted) {
+          const text = fetched[pair.hafs];
+          if (text) result[`${surah}:${pair.warsh}`] = text;
+          done++;
+        }
+        setFetchProg({ done, total: unique.length });
+        await new Promise<void>(r => setTimeout(r, 100)); // rate limit
+      } catch (e: any) {
+        setFetchErr(`Surah ${surah}: ${e.message}`);
+      }
+    }
+
+    setOfflineTafsir(result);
+    setFetchingTafsir(false);
+  };
+
+  const exportOfflineTafsir = () => {
+    const payload = {
+      _version: 1, _date: new Date().toISOString(),
+      tafsirSource: tafsirSrc, tafsirName: TAFSIR_SOURCES[tafsirSrc].name,
+      hafsWarshOffsets: offsets,
+      tafsirs: offlineTafsir, // key: "surah:warshAyah", value: tafsir text
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tafsir-offline-${tafsirSrc}-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ fontSize: 11, color: "#9ca3af", direction: "rtl", lineHeight: 1.8 }}>
+        <b style={{ color: "#c9a96e" }}>🗺️ مزامنة الآيات بين حفص وورش</b><br />
+        معظم السور لها نفس ترقيم الآيات في حفص وورش. الاختلافات نادرة.
+        <br />
+        إذا لاحظت خطأ في التفسير (يُرجع تفسير آية خاطئة)، اضبط الفارق هنا:
+        <br />
+        <code style={S.ic}>الفارق = رقم ورش − رقم حفص</code>
+        &nbsp;(موجب = ورش يبدأ من رقم أعلى، سالب = ورش أقل)
+      </div>
+
+      {/* Offset table */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          فوارق الآيات بين ورش وحفص — السور المعالجة
+        </div>
+        {allSurahs.map(sn => {
+          const off = offsets[sn] ?? 0;
+          const isEditing = editingSurah === sn;
+          return (
+            <div key={sn} style={{ display: "flex", alignItems: "center", gap: 8, background: off !== 0 ? "#c9a96e10" : "#0f1117", border: `1px solid ${off !== 0 ? "#c9a96e44" : "#1e2332"}`, borderRadius: 6, padding: "5px 10px" }}>
+              <span style={{ ...S.historyPageBadge, minWidth: 40, textAlign: "center" }}>سورة {sn}</span>
+              <span style={{ fontSize: 10, color: "#6b7280", flex: 1 }}>
+                {off === 0 ? "نفس الترقيم" : off > 0 ? `ورش +${off} عن حفص` : `ورش ${off} عن حفص`}
+              </span>
+              {isEditing ? (
+                <>
+                  <input type="number" value={editVal} onChange={(e) => setEditVal(e.target.value)}
+                    style={{ ...SP.numInput, width: 60 }} autoFocus />
+                  <button style={S.actBtn} onClick={() => {
+                    const v = parseInt(editVal) || 0;
+                    saveOffsets({ ...offsets, [sn]: v });
+                    setEditingSurah(null);
+                  }}>✅</button>
+                  <button style={S.actBtn} onClick={() => setEditingSurah(null)}>✕</button>
+                </>
+              ) : (
+                <>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: off === 0 ? "#4b5563" : "#c9a96e", minWidth: 30, textAlign: "center" }}>
+                    {off === 0 ? "0" : off > 0 ? `+${off}` : `${off}`}
+                  </span>
+                  <button style={S.miniBtn} onClick={() => { setEditingSurah(sn); setEditVal(String(offsets[sn] ?? 0)); }}>✏️</button>
+                </>
+              )}
+            </div>
+          );
+        })}
+        {allSurahs.length === 0 && <div style={{ color: "#4b5563", textAlign: "center", padding: 20 }}>لا توجد صفحات معالجة بعد.</div>}
+      </div>
+
+      {/* Offline tafsir fetch */}
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          📖 استخراج التفسير أوفلاين
+        </div>
+        <div style={{ fontSize: 10, color: "#6b7280", direction: "rtl", lineHeight: 1.7 }}>
+          اجلب التفسير لجميع الآيات المعالجة مرة واحدة وصدّره كملف JSON.
+          يمكنك تضمينه في مشروعك للعمل بدون إنترنت.
+          سيُستخدم الفارق أعلاه لتحويل ترقيم ورش → حفص قبل الجلب.
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <select style={{ ...S.input, width: "auto" }} value={tafsirSrc}
+            onChange={(e) => setTafsirSrc(e.target.value as any)}>
+            {Object.entries(TAFSIR_SOURCES).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+          </select>
+          <button style={S.exportBtn} onClick={fetchAllOfflineTafsir} disabled={fetchingTafsir || history.length === 0}>
+            {fetchingTafsir ? `⏳ ${fetchProg.done}/${fetchProg.total}...` : "⬇️ جلب التفسير لكل الصفحات"}
+          </button>
+          {Object.keys(offlineTafsir).length > 0 && (
+            <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#10b981,#059669)" }}
+              onClick={exportOfflineTafsir}>
+              💾 تصدير JSON ({Object.keys(offlineTafsir).length} آية)
+            </button>
+          )}
+        </div>
+        {fetchingTafsir && (
+          <div style={S.pTrack}>
+            <div style={{ ...S.pFill, width: `${fetchProg.total ? (fetchProg.done/fetchProg.total)*100 : 0}%` }} />
+          </div>
+        )}
+        {fetchErr && <div style={{ fontSize: 10, color: "#f87171" }}>⚠️ {fetchErr}</div>}
+        {Object.keys(offlineTafsir).length > 0 && (
+          <div style={{ fontSize: 10, color: "#4ade80" }}>
+            ✅ {Object.keys(offlineTafsir).length} آية جاهزة للتصدير
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function QuranProcessor() {
-  // ── Persisted state loaded from localStorage ONCE
+  // ── State (IndexedDB for pages, localStorage for settings)
   const [ready,        setReady]        = useState(false);
   const [history,      setHistory]      = useState<HistoryEntry[]>([]);
   const [allOffsets,   setAllOffsets]   = useState<Record<string, OffsetMap>>({});
@@ -2092,12 +2708,18 @@ export default function QuranProcessor() {
   const [svgoFP,       setSvgoFP]       = useState(3);
   const [svgoMP,       setSvgoMP]       = useState(true);
   const [backupError,  setBackupError]  = useState<string | null>(null);
+  const [backupProg,   setBackupProg]   = useState<{done:number;total:number}|null>(null);
   const backupFileRef = useRef<HTMLInputElement>(null);
 
-  // Load once on mount
+  // Helper: get current Settings object
+  const currentSettings = (): Settings => ({
+    allOffsets, allColors, annotations, lineGap, hizbCursor,
+    lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP,
+  });
+
+  // Load once on mount — IndexedDB for pages, localStorage for settings
   useEffect(() => {
-    const s = loadAppState();
-    setHistory(s.history);
+    const s = loadSettings();
     setAllOffsets(s.allOffsets);
     setAllColors(s.allColors);
     setAnnotations(s.annotations);
@@ -2105,15 +2727,20 @@ export default function QuranProcessor() {
     setHizbCursor(s.hizbCursor);
     setSvgoFP(s.svgoFloatPrec);
     setSvgoMP(s.svgoMultipass);
-
     setPageNumber(s.lastPageNumber || 1);
-    setReady(true);
+
+    // Load pages from IndexedDB
+    idbGetAll().then((pages) => {
+      setHistory(pages.sort((a, b) => a.pageNumber - b.pageNumber));
+      setReady(true);
+    }).catch(() => setReady(true));
   }, []);
 
-  // Save on every change — but only after initial load
+  // Save settings on every change (lightweight — no SVG data)
   useEffect(() => {
     if (!ready) return;
-    saveAppState({ history, allOffsets, allColors, annotations, lineGap, hizbCursor, lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP });
+    saveSettings({ allOffsets, allColors, annotations, lineGap, hizbCursor,
+      lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP });
   });
 
   // ── Single-page processor state
@@ -2170,6 +2797,7 @@ export default function QuranProcessor() {
     if (!activeEntry) return;
     const updated = { ...activeEntry, pageAlign: align };
     setActiveEntry(updated);
+    idbPut(updated).catch(console.error);
     setHistory((prev) => prev.map((e) => e.id === activeEntry.id ? updated : e));
   }, [activeEntry]);
 
@@ -2177,12 +2805,44 @@ export default function QuranProcessor() {
     if (!activeEntry) return;
     const updated = { ...activeEntry, wordGap: gap };
     setActiveEntry(updated);
+    idbPut(updated).catch(console.error);
     setHistory((prev) => prev.map((e) => e.id === activeEntry.id ? updated : e));
   }, [activeEntry]);
 
+  // Apply lineGap to ALL pages (with optional exclude list)
+  const handleApplyGapToAll = useCallback((gap: number, excludeNums: number[] = []) => {
+    setHistory((prev) => {
+      const next = prev.map((e) =>
+        excludeNums.includes(e.pageNumber) ? e : { ...e }
+      );
+      // Save to IDB
+      const toUpdate = next.filter((e) => !excludeNums.includes(e.pageNumber));
+      idbPutMany(toUpdate).catch(console.error);
+      return next;
+    });
+    setLineGap(gap);
+  }, []);
+
+  // Apply wordGap to ALL pages
+  const handleApplyWordGapToAll = useCallback((gap: number, excludeNums: number[] = []) => {
+    setHistory((prev) => {
+      const next = prev.map((e) =>
+        excludeNums.includes(e.pageNumber) ? e : { ...e, wordGap: gap }
+      );
+      const toUpdate = next.filter((e) => !excludeNums.includes(e.pageNumber));
+      idbPutMany(toUpdate).catch(console.error);
+      return next;
+    });
+  }, []);
+
   // Copy text overrides handler
   const handleCopyOverrideSave = useCallback((entryId: string, overrides: Record<string, string>) => {
-    setHistory((prev) => prev.map((e) => e.id === entryId ? { ...e, copyOverrides: { ...(e.copyOverrides ?? {}), ...overrides } } : e));
+    setHistory((prev) => {
+      const next = prev.map((e) => e.id === entryId ? { ...e, copyOverrides: { ...(e.copyOverrides ?? {}), ...overrides } } : e);
+      const updated = next.find((e) => e.id === entryId);
+      if (updated) idbPut(updated).catch(console.error);
+      return next;
+    });
     if (activeEntry?.id === entryId) {
       setActiveEntry((prev) => prev ? { ...prev, copyOverrides: { ...(prev.copyOverrides ?? {}), ...overrides } } : prev);
     }
@@ -2202,6 +2862,7 @@ export default function QuranProcessor() {
       );
       setHizbCursor(hizbCursorOut);
       const full: HistoryEntry = { ...entry, searchOverrides: {}, copyOverrides: {}, pageAlign: "justify", wordGap: 2 };
+      idbPut(full).catch(console.error);
       setHistory((prev) => { const i = prev.findIndex((e) => e.pageNumber === pageNumber); if (i !== -1) { const n = [...prev]; n[i] = full; return n; } return [...prev, full]; });
       setActiveEntry(full);
       setOutputTab("tsx");
@@ -2213,6 +2874,7 @@ export default function QuranProcessor() {
 
   const handleBatchDone = (entries: HistoryEntry[], newCursor: number) => {
     setHizbCursor(newCursor);
+    idbPutMany(entries).catch(console.error);
     setHistory((prev) => {
       let next = [...prev];
       for (const e of entries) {
@@ -2237,17 +2899,23 @@ export default function QuranProcessor() {
     if (history.length === 0) return;
     dl(generateMushafManager(history, allOffsets, lineGap), "MushafManager.tsx");
   };
-  const removeEntry = (id: string) => { setHistory((prev) => prev.filter((e) => e.id !== id)); if (activeEntry?.id === id) setActiveEntry(null); };
+  const removeEntry = (id: string) => { idbDelete(id).catch(console.error); setHistory((prev) => prev.filter((e) => e.id !== id)); if (activeEntry?.id === id) setActiveEntry(null); };
   const renameEntry = (id: string, label: string) => {
-    setHistory((prev) => prev.map((e) => e.id === id ? { ...e, label } : e));
+    setHistory((prev) => {
+      const next = prev.map((e) => e.id === id ? { ...e, label } : e);
+      const updated = next.find((e) => e.id === id);
+      if (updated) idbPut(updated).catch(console.error);
+      return next;
+    });
     setActiveEntry((prev) => prev?.id === id ? { ...prev!, label } : prev);
   };
   const clearAll = () => {
-    if (!confirm("Clear everything?")) return;
-    const d = defaultState();
+    if (!confirm("مسح كل شيء؟ هذا لا يمكن التراجع عنه.")) return;
+    idbClear().catch(console.error);
     setHistory([]); setAllOffsets({}); setAllColors({}); setAnnotations({});
-    setLineGap(d.lineGap); setHizbCursor(0); setActiveEntry(null);
-    localStorage.removeItem(STORAGE_KEY);
+    setLineGap(4); setHizbCursor(0); setActiveEntry(null);
+    localStorage.removeItem(SETTINGS_KEY);
+    localStorage.removeItem(STORAGE_KEY); // legacy cleanup
   };
 
   const isRunning  = step !== "idle" && step !== "done" && step !== "error";
@@ -2280,7 +2948,7 @@ export default function QuranProcessor() {
           </div>
 
           <nav style={S.nav}>
-            {([["processor","⚙️ Process"],["import","📦 Import"],["history","📚 History"],["previewer","🔍 Preview"],["manager","📋 Manager"]] as [MainView,string][]).map(([v,l]) => (
+            {([["processor","⚙️ Process"],["import","📦 Import"],["history","📚 History"],["previewer","🔍 Preview"],["manager","📋 Manager"],["mapping","🗺️ Mapping"]] as [MainView,string][]).map(([v,l]) => (
               <button key={v} style={{ ...S.navBtn, ...(view === v ? S.navBtnOn : {}) }} onClick={() => setView(v)}>
                 {l}{v === "history" && history.length > 0 ? <span style={S.navBadge}>{history.length}</span> : null}
               </button>
@@ -2340,34 +3008,69 @@ export default function QuranProcessor() {
             <section style={S.card}>
               <div style={S.cardTitle}>💾 Backup</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                <button style={{ ...S.exportBtn, width: "100%" }}
-                  onClick={() => exportBackup({ history, allOffsets, allColors, annotations, lineGap, hizbCursor, lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP })}>
-                  ⬇️ Export backup
+                <button style={{ ...S.exportBtn, width: "100%", opacity: backupProg ? 0.6 : 1 }}
+                  disabled={!!backupProg}
+                  onClick={async () => {
+                    setBackupProg({ done: 0, total: history.length });
+                    try {
+                      await exportBackup(history, currentSettings(), (done, total) => setBackupProg({ done, total }));
+                    } catch (e: any) { setBackupError(e.message); }
+                    setBackupProg(null);
+                  }}>
+                  {backupProg
+                    ? `⏳ ${backupProg.done}/${backupProg.total} صفحة...`
+                    : `⬇️ Export backup (${history.length})`}
                 </button>
                 <button style={{ ...S.toggle, width: "100%", fontSize: 11 }}
                   onClick={() => backupFileRef.current?.click()}>
                   ⬆️ Import backup
                 </button>
                 <input ref={backupFileRef} type="file" accept=".json" style={{ display: "none" }}
+                  multiple
                   onChange={async (e) => {
-                    const f = e.target.files?.[0];
-                    if (!f) return;
+                    const files = Array.from(e.target.files ?? []);
+                    if (!files.length) return;
                     try {
-                      const restored = await importBackup(f);
-                      setHistory(restored.history);
-                      setAllOffsets(restored.allOffsets);
-                      setAllColors(restored.allColors);
-                      setAnnotations(restored.annotations);
-                      setLineGap(restored.lineGap);
-                      setHizbCursor(restored.hizbCursor);
-                      setSvgoFP(restored.svgoFloatPrec);
-                      setSvgoMP(restored.svgoMultipass);
-                      saveAppState(restored);
+                      setBackupProg({ done: 0, total: files.length });
+                      let allPages: HistoryEntry[] = [];
+                      let mergedSettings: Settings | null = null;
+
+                      // Sort files by chunk number if multiple
+                      const sorted = files.sort((a, b) => {
+                        const numA = parseInt(a.name.match(/part(\d+)of/)?.[1] ?? "1");
+                        const numB = parseInt(b.name.match(/part(\d+)of/)?.[1] ?? "1");
+                        return numA - numB;
+                      });
+
+                      for (let fi = 0; fi < sorted.length; fi++) {
+                        const { pages, settings, isChunk, chunkInfo } = await importBackup(sorted[fi]);
+                        allPages = [...allPages, ...pages];
+                        if (settings && (!mergedSettings || !isChunk)) mergedSettings = settings;
+                        setBackupProg({ done: fi + 1, total: sorted.length });
+                      }
+
+                      if (!mergedSettings) mergedSettings = defaultSettings();
+
+                      // Write all pages to IndexedDB
+                      await idbPutMany(allPages);
+
+                      // Restore state
+                      const uniquePages = allPages.filter((p, i, arr) => arr.findIndex(x => x.id === p.id) === i);
+                      setHistory(uniquePages.sort((a, b) => a.pageNumber - b.pageNumber));
+                      setAllOffsets(mergedSettings.allOffsets);
+                      setAllColors(mergedSettings.allColors);
+                      setAnnotations(mergedSettings.annotations);
+                      setLineGap(mergedSettings.lineGap);
+                      setHizbCursor(mergedSettings.hizbCursor);
+                      setSvgoFP(mergedSettings.svgoFloatPrec);
+                      setSvgoMP(mergedSettings.svgoMultipass);
+                      saveSettings(mergedSettings);
                       setBackupError(null);
-                      alert("✅ تم استيراد النسخة الاحتياطية بنجاح");
+                      alert(`✅ تم الاستيراد: ${uniquePages.length} صفحة من ${sorted.length} ملف`);
                     } catch (err: any) {
-                      setBackupError(err.message);
+                      setBackupError(String(err.message ?? err));
                     }
+                    setBackupProg(null);
                     e.target.value = "";
                   }} />
                 {backupError && <div style={{ fontSize: 9, color: "#f87171" }}>{backupError}</div>}
@@ -2471,6 +3174,7 @@ export default function QuranProcessor() {
                     lineGap={lineGap} onLineGapChange={setLineGap}
                     pageAlign={activeEntry.pageAlign ?? "justify"} onPageAlignChange={handlePageAlignChange}
                     wordGap={activeEntry.wordGap ?? 2} onWordGapChange={handleWordGapChange}
+                    onApplyGapToAll={handleApplyGapToAll} onApplyWordGapToAll={handleApplyWordGapToAll}
                   />
                 )}
                 {outputTab === "apis" && (
@@ -2536,8 +3240,18 @@ export default function QuranProcessor() {
                 lineGap={lineGap} onLineGapChange={setLineGap}
                 pageAlign={activeEntry.pageAlign ?? "justify"} onPageAlignChange={handlePageAlignChange}
                 wordGap={activeEntry.wordGap ?? 2} onWordGapChange={handleWordGapChange}
+                onApplyGapToAll={handleApplyGapToAll} onApplyWordGapToAll={handleApplyWordGapToAll}
               />
             )}
+          </section>
+        </main>
+      )}
+
+      {/* MAPPING — Hafs/Warsh ayah number sync + offline tafsir */}
+      {view === "mapping" && (
+        <main style={{ ...S.main, display: "block", maxWidth: 1000 }}>
+          <section style={S.card}>
+            <HafsWarshMapping history={history} />
           </section>
         </main>
       )}
@@ -2549,6 +3263,18 @@ export default function QuranProcessor() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
               <div style={S.cardTitle}>📋 Manager</div>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {/* NEW: Apply Auto Layout */}
+                <button style={S.exportBtn} onClick={() => {
+                  const updated = applyAutoLayout(history);
+                  setHistory(updated);
+                  idbPutMany(updated).catch(console.error);
+                  // If active entry is affected, refresh it
+                  if (activeEntry) {
+                    const refreshed = updated.find(e => e.id === activeEntry.id);
+                    if (refreshed) setActiveEntry(refreshed);
+                  }
+                }}>📐 Apply Auto Layout (P1-2 & Rest)</button>
+
                 {Object.values(allOffsets).some((om) => Object.values(om).some((o) => o.x !== 0 || o.y !== 0)) && (
                   <button style={S.exportBtn} onClick={() => {
                     const all = history.map((e) => { const { lineGroups } = buildWordMetas(e.parsed, 60); return generateOffsetCss(allOffsets[e.id] ?? {}, e.pageNumber, e.surahNumbers, lineGroups, lineGap); }).join("\n\n");
@@ -2578,7 +3304,8 @@ export default function QuranProcessor() {
                       }
                       cssDir.file("mushaf_offsets.css", allCssParts.join("\n\n"));
                       zip.file("MushafManager.tsx", generateMushafManager(history, allOffsets, lineGap));
-                      zip.file("backup.json", JSON.stringify({ history, allOffsets, allColors, annotations, lineGap, hizbCursor }, null, 2));
+                      // backup.json: settings only (pages are in individual TSX files)
+                      zip.file("backup.json", JSON.stringify({ _version: BACKUP_VERSION, _date: new Date().toISOString(), settings: currentSettings(), pageIds: sorted.map(e => e.id) }, null, 2));
                       zip.file("README.txt",
                         "Quran Processor Export\n======================\n\n" +
                         `Pages: ${sorted.map((e) => e.pageNumber).join(", ")}\n` +
@@ -2605,6 +3332,8 @@ export default function QuranProcessor() {
                 </button>
               </div>
             </div>
+            
+              
             {history.length === 0 ? <div style={{ color: "#4b5563", textAlign: "center", padding: "30px 0" }}>No pages yet.</div> : (
               <>
                 <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
