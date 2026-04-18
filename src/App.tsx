@@ -4,7 +4,116 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { optimize } from "svgo";
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DOCX EXPORT — generates a Word document from processed pages
+// Uses docx library loaded from CDN
+// ══════════════════════════════════════════════════════════════════════════════
+
+function loadDocxLib(): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (typeof window !== "undefined" && (window as any).docx) { resolve((window as any).docx); return; }
+    const script = document.createElement("script");
+    // Use the IIFE bundle from CDN
+    script.src = "https://unpkg.com/docx@8.5.0/build/index.js";
+    script.onload = () => {
+      if ((window as any).docx) resolve((window as any).docx);
+      else reject(new Error("docx library not found on window after load"));
+    };
+    script.onerror = () => reject(new Error("Failed to load docx library"));
+    document.head.appendChild(script);
+  });
+}
+
+async function exportDocx(
+  history: HistoryEntry[],
+  copyOverrides: Record<string, Record<string, string>>,
+  onProgress?: (done: number, total: number) => void,
+): Promise<void> {
+  const docxLib = await loadDocxLib();
+  const { Document, Packer, Paragraph, TextRun, AlignmentType } = docxLib;
+
+  const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+  const children: any[] = [];
+
+  let done = 0;
+  const total = sorted.reduce((s, e) => s + e.parsed.segments.reduce((ss, sg) => ss + sg.ayahs.length, 0), 0);
+
+  for (const entry of sorted) {
+    for (const seg of entry.parsed.segments) {
+      // Surah title
+      if (seg.surahTitle) {
+        children.push(new Paragraph({
+          alignment: AlignmentType.CENTER,
+          bidirectional: true,
+          spacing: { before: 280, after: 140 },
+          children: [new TextRun({
+            text: seg.surahTitle,
+            bold: true,
+            size: 28,
+            font: "AALMAGHRIBI",
+            rtl: true,
+          })],
+        }));
+      }
+
+      for (const a of seg.ayahs) {
+        if (a.ayahNum <= 0) continue;
+        const key = `${seg.surahNumber}:${a.ayahNum}`;
+        const copyText = (copyOverrides[entry.id] ?? {})[key] ?? entry.copyOverrides?.[key] ?? "";
+        const displayText = a.words.filter((w: any) => !w.isAyahMarker).map((w: any) => w.dataTxt).join(" ");
+        const text = copyText || displayText;
+        if (!text.trim()) continue;
+
+        children.push(new Paragraph({
+          alignment: AlignmentType.JUSTIFY,
+          bidirectional: true,
+          spacing: { before: 60, after: 60, line: 480, lineRule: "auto" },
+          children: [
+            new TextRun({
+              text: `(${a.ayahNum}) `,
+              size: 20,
+              color: "888888",
+              rtl: true,
+            }),
+            new TextRun({
+              text,
+              size: 26,
+              font: "AALMAGHRIBI",
+              rtl: true,
+            }),
+          ],
+        }));
+
+        done++;
+        onProgress?.(done, total);
+        // Yield every 50 ayahs
+        if (done % 50 === 0) await new Promise<void>((r) => setTimeout(r, 0));
+      }
+    }
+  }
+
+  const doc = new Document({
+    sections: [{
+      properties: {
+        page: {
+          size: { width: 11906, height: 16838 }, // A4
+          margin: { top: 1134, right: 850, bottom: 1134, left: 850 },
+        },
+      },
+      children,
+    }],
+  });
+
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `quran-mushaf-${new Date().toISOString().slice(0, 10)}.docx`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
 
 function loadJSZip(): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -21,7 +130,7 @@ function loadJSZip(): Promise<any> {
 // CONSTANTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-const STORAGE_KEY = "qproc_v14"; // legacy localStorage key
+
 
 // ── External APIs ─────────────────────────────────────────────────────────────
 // Quran.com API v4 — tafsir, translations, metadata (no auth needed for basic reads)
@@ -55,10 +164,18 @@ const DEFAULT_TAFSIR = "ibn_kathir";
 // Hizb markers — fraction = what fraction of ONE hizb this mark represents
 // 60 hizbs total, each hizb = 4 ربع = 8 ثمن
 const HIZB_MARKERS: Record<string, { label: string; fraction: number; symbol: string }> = {
+  "ثُمُنٌ": { label: "ثمن", fraction: 0.125, symbol: "⅛" },
+  "ثمن":   { label: "ثمن", fraction: 0.125, symbol: "⅛" },
   "®":     { label: "ثمن", fraction: 0.125, symbol: "⅛" },
-  "©":     { label: "ربع", fraction: 0.125,  symbol: "¼" },
-  "¥":     { label: "نصف", fraction: 0.125,   symbol: "½" },
-  "¤":     { label: "حزب", fraction: .125,     symbol: "◉" },
+  "رُبْعٌ": { label: "ربع", fraction: 0.25,  symbol: "¼" },
+  "ربع":   { label: "ربع", fraction: 0.25,  symbol: "¼" },
+  "©":     { label: "ربع", fraction: 0.25,  symbol: "¼" },
+  "نِصْفٌ": { label: "نصف", fraction: 0.5,   symbol: "½" },
+  "نصف":   { label: "نصف", fraction: 0.5,   symbol: "½" },
+  "¥":     { label: "نصف", fraction: 0.5,   symbol: "½" },
+  "حِزْبٌ": { label: "حزب", fraction: 1,     symbol: "◉" },
+  "حزب":   { label: "حزب", fraction: 1,     symbol: "◉" },
+  "¤":     { label: "حزب", fraction: 1,     symbol: "◉" },
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -87,8 +204,6 @@ interface WordToken {
   ayahNumber: number | null;
   surahNumber: number;
   hizbMark: HizbMark | null;
-  svgRaw: string;
-  svgCompressed: string;
 }
 
 interface LineToken { words: WordToken[] }
@@ -107,6 +222,7 @@ interface SurahSegment {
   surahNumber: number;
   surahTitle: string | null;
   ayahs: AyahGroup[];
+  lineStart: number;  // which line index this surah first appears on
 }
 
 interface ParsedPage {
@@ -114,8 +230,6 @@ interface ParsedPage {
   surahNumbers: number[];
   segments: SurahSegment[];
   lines: LineToken[];
-  originalBytes: number;
-  compressedBytes: number;
   hizbMarks: HizbMark[];
   hizbAtStart: number;
   hasSajda: boolean;    // page contains a sajda (¦ U+00A6 in data-txt)
@@ -131,12 +245,11 @@ interface HistoryEntry {
   savedAt: number;
   searchOverrides: Record<string, string>;
   copyOverrides:   Record<string, string>;
-  pageAlign: "center" | "justify" | "flex-start" | "flex-end";  // per-page alignment
-  wordGap:   number;   // px gap between words (0 = tight, default 2)
+  pageAlign:   "center" | "justify" | "flex-start" | "flex-end";  // per-page alignment
+  wordGap:     number;   // width scale % of SVG div (0 = auto)
+  wordMargin:  number;   // px gap injected between word divs (default 0)
 }
 
-interface WordOffset { x: number; y: number }
-type OffsetMap      = Record<string, WordOffset>;
 type ColorMap       = Record<string, string>;
 
 interface Annotation {
@@ -162,20 +275,9 @@ interface ImportItem {
   error?: string;
 }
 
-type Step     = "idle" | "parsing" | "compressing" | "generating" | "done" | "error";
+type Step     = "idle" | "parsing" | "done" | "error";
 type MainView = "processor" | "import" | "history" | "previewer" | "manager" | "mapping";
 
-interface AppState {
-  history:          HistoryEntry[];
-  allOffsets:       Record<string, OffsetMap>;
-  allColors:        Record<string, ColorMap>;
-  annotations:      AnnotationStore;
-  lineGap:          number;
-  hizbCursor:       number;
-  lastPageNumber:   number;
-  svgoFloatPrec:    number;
-  svgoMultipass:    boolean;
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ARABIC NORMALIZATION
@@ -245,11 +347,11 @@ function buildPositionId(label: string, hizbFraction: number): string {
   // Named position
   const POSITION_NAMES: Record<number, string> = {
     1: "ثمن_1",
-    2: "ربع_2",
+    2: "ربع_1",
     3: "ثمن_3",
-    4: "نصف_4",
+    4: "نصف",
     5: "ثمن_5",
-    6: "ربع_6",
+    6: "ربع_3",
     7: "ثمن_7",
     8: "حزب",
   };
@@ -263,25 +365,6 @@ function buildPositionId(label: string, hizbFraction: number): string {
 // buildPositionId("ربع", 0.25) → hizb_1_ربع_2 ✓
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SVGO
-// ══════════════════════════════════════════════════════════════════════════════
-
-function compressWithSvgo(svg: string, fp: number, mp: boolean): string {
-  try {
-    const r = optimize(svg, {
-      multipass: mp,
-      plugins: [{ name: "preset-default", params: { overrides: {
-        removeViewBox: false,
-        convertPathData: { floatPrecision: fp },
-        convertTransform: { floatPrecision: fp },
-        cleanupNumericValues: { floatPrecision: fp },
-      }}}],
-    });
-    return r.data;
-  } catch { return svg; }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
 // INPUT SANITIZER
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -292,12 +375,6 @@ function unescapeInput(raw: string): string {
     .replace(/\\n/g, "\n").replace(/\\r/g, "\r")
     .replace(/\\t/g, "\t").replace(/\\\//g, "/")
     .replace(/\\\\/g, "\\");
-}
-
-function cleanSvg(svg: string): string {
-  let s = unescapeInput(svg).trim();
-  if (!s.startsWith("<svg")) { const i = s.indexOf("<svg"); if (i !== -1) s = s.slice(i); else return svg; }
-  return s;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -372,16 +449,13 @@ function parseQuranHtml(
         hizbMarks.push(hizbMark);
       }
 
-      const svgEl  = el.querySelector("svg");
-      const svgRaw = svgEl ? cleanSvg(svgEl.outerHTML) : "";
-
       const word: WordToken = {
         dataTxt,
         searchTxtAuto:   normalizeArabic(dataTxt),
         searchTxtManual: "",
         classList: cls, wid, aid, atid,
         isAyahMarker, ayahNumber, surahNumber: sn,
-        hizbMark, svgRaw, svgCompressed: "",
+        hizbMark,
       };
 
       currentLine.push(word);
@@ -394,6 +468,16 @@ function parseQuranHtml(
   }
 
   if (currentLine.length > 0) lines.push({ words: [...currentLine] });
+
+  // Track which line index each surah first appears on (for title placement)
+  const surahFirstLine: Record<number, number> = {};
+  for (let li = 0; li < lines.length; li++) {
+    for (const w of lines[li].words) {
+      if (w.surahNumber !== undefined && !(w.surahNumber in surahFirstLine)) {
+        surahFirstLine[w.surahNumber] = li;
+      }
+    }
+  }
 
   const segments: SurahSegment[] = [];
   for (const sn of surahNumbers) {
@@ -433,7 +517,7 @@ function parseQuranHtml(
       }
     }
 
-    segments.push({ surahNumber: sn, surahTitle: seg.surahTitle, ayahs });
+    segments.push({ surahNumber: sn, surahTitle: seg.surahTitle, ayahs, lineStart: surahFirstLine[sn] ?? 0 });
   }
 
   // Detect sajda: ¦ (U+00A6) in any word's dataTxt
@@ -460,6 +544,52 @@ function generateTsx(
 ): string {
   const { pageNumber, surahNumbers, segments, lines, hizbMarks, hizbAtStart } = parsed;
 
+  // Pre-compute: wordId → normalized copy text from copyData distribution
+  // Splitting rules:
+  //   complete ayah (isCopyStart && isCopyEnd): words 0..N matched to tokens 0..N
+  //   start of ayah, continues next page (isCopyStart && !isCopyEnd):
+  //       this page shows the FIRST svgCount words → tokens[0..svgCount-1]
+  //   end of ayah, started prev page (!isCopyStart && isCopyEnd):
+  //       this page shows the LAST svgCount words → tokens[copyCount-svgCount..copyCount-1]
+  //   middle (neither): cannot determine position → all empty
+  const wordCopyMap = new Map<string, string>();
+  for (const seg of segments) {
+    for (const a of seg.ayahs) {
+      const contentWds  = a.words.filter((w) => !w.isAyahMarker);
+      const overKey     = `${seg.surahNumber}:${a.ayahNum}`;
+      const copyRaw     = (copyOverrides ?? {})[overKey] ?? "";
+      const cTokens     = copyRaw.trim() ? copyRaw.trim().split(/\s+/) : [];
+      const isCopyStart = !a.continuesFromPrev;  // ayah starts on this page
+      const isCopyEnd   = a.isComplete;            // ayah ends on this page
+      const svgCount    = contentWds.length;
+      const copyCount   = cTokens.length;
+      let assignedTokens: string[] = new Array(svgCount).fill("");
+
+      if (cTokens.length > 0 && svgCount > 0) {
+        if (isCopyStart) {
+          // Always take from the beginning — whether complete or continues to next
+          for (let i = 0; i < svgCount; i++) {
+            assignedTokens[i] = cTokens[i] ?? "";
+          }
+        } else if (!isCopyStart && isCopyEnd) {
+          // Ayah started on prev page — take LAST svgCount tokens
+          const offset = Math.max(0, copyCount - svgCount);
+          for (let i = 0; i < svgCount; i++) {
+            assignedTokens[i] = cTokens[offset + i] ?? "";
+          }
+        }
+        // else: middle section — leave all empty (can't determine position)
+      }
+
+      for (let wi = 0; wi < contentWds.length; wi++) {
+        const w   = contentWds[wi];
+        const uid = w.wid !== null ? `word_${w.wid}_page_${pageNumber}` : `word_p${pageNumber}_l${wi}`;
+        const raw = assignedTokens[wi] ?? "";
+        if (raw.trim()) wordCopyMap.set(uid, normalizeArabic(raw));
+      }
+    }
+  }
+
   const linesCode = lines.map((line, li) => {
     const wordsCode = line.words.map((w) => {
       const uid = w.wid !== null ? `word_${w.wid}_page_${pageNumber}` : `word_p${pageNumber}_l${li}`;
@@ -478,10 +608,10 @@ function generateTsx(
         `      id: ${JSON.stringify(uid)},`,
         `      dataTxt: ${JSON.stringify(w.dataTxt)},`,
         `      searchTxtAuto: ${JSON.stringify(w.searchTxtAuto)},`,
-        `      searchTxtManual: ${JSON.stringify(w.searchTxtManual)},`,
+        `      searchTxtManual: ${JSON.stringify(wordCopyMap.get(uid) ?? w.searchTxtManual)},`,
         `      ayahId: ${w.aid ?? "null"}, surahNumber: ${w.surahNumber},`,
         `      isAyahMarker: ${w.isAyahMarker}, ayahNumber: ${w.ayahNumber ?? "null"}, isSajda: ${w.dataTxt.includes("\u00A6")}${hizbStr}${tafsirStr}${riwayaStr},`,
-        `      svg: ${JSON.stringify(w.svgCompressed || w.svgRaw)},`,
+
         `    }`,
       ].join("\n");
     }).join(",\n");
@@ -497,50 +627,34 @@ function generateTsx(
       const searchDataManual = searchOverrides[overrideKey] ?? "";
       const copyDataManual   = (copyOverrides ?? {})[overrideKey] ?? "";
 
-      // Compute per-word copyData distribution
-      // Split copyData by whitespace → assign word-by-word to SVG content words
-      const copyTokens = copyDataManual.trim() ? copyDataManual.trim().split(/\s+/) : [];
+      // Per-word copyData distribution — same rules as wordCopyMap
+      const copyTokens   = copyDataManual.trim() ? copyDataManual.trim().split(/\s+/) : [];
       const svgWordCount = contentWords.length;
       const copyWordCount = copyTokens.length;
-      // Determine if this page has the start/end of the ayah
-      const isCopyStart    = !a.continuesFromPrev;
-      const isCopyEnd      = a.isComplete;
+      const isCopyStart   = !a.continuesFromPrev;
+      const isCopyEnd     = a.isComplete;
       const isCopyComplete = isCopyStart && isCopyEnd;
-      // The part of copyData visible on this page
-      // If continuesFromPrev: page shows the TAIL of the ayah
-      // If !isComplete: page shows the HEAD of the ayah
-      let copyDataPart = copyDataManual;
-      const copyWords: string[] = [];
-      if (copyTokens.length > 0) {
-        if (isCopyComplete) {
-          // Full ayah on one page: match 1:1
+      const copyWords: string[] = new Array(svgWordCount).fill("");
+      let copyDataPart = "";
+
+      if (copyTokens.length > 0 && svgWordCount > 0) {
+        if (isCopyStart) {
+          // Complete or head of ayah: take from the beginning
           for (let wi = 0; wi < svgWordCount; wi++) {
-            copyWords.push(copyTokens[wi] ?? "");
-          }
-          copyDataPart = copyDataManual;
-        } else if (isCopyStart && !isCopyEnd) {
-          // Ayah starts here, continues to next page
-          // Assign first N tokens to the SVG words on this page
-          for (let wi = 0; wi < svgWordCount; wi++) {
-            copyWords.push(copyTokens[wi] ?? "");
+            copyWords[wi] = copyTokens[wi] ?? "";
           }
           copyDataPart = copyTokens.slice(0, svgWordCount).join(" ");
         } else if (!isCopyStart && isCopyEnd) {
-          // Ayah started on prev page, ends here
-          // The LAST N tokens correspond to words on this page
+          // Tail of ayah: take from the end
           const offset = Math.max(0, copyWordCount - svgWordCount);
           for (let wi = 0; wi < svgWordCount; wi++) {
-            copyWords.push(copyTokens[offset + wi] ?? "");
+            copyWords[wi] = copyTokens[offset + wi] ?? "";
           }
           copyDataPart = copyTokens.slice(offset).join(" ");
-        } else {
-          // Middle of ayah — can't determine which tokens are here
-          for (let wi = 0; wi < svgWordCount; wi++) copyWords.push("");
-          copyDataPart = "";
         }
-      } else {
-        for (let wi = 0; wi < svgWordCount; wi++) copyWords.push("");
+        // middle: leave all empty
       }
+      if (isCopyComplete) copyDataPart = copyDataManual;
       const ayahKey  = `ayah_${seg.surahNumber}_${a.aid}`;
       const ayahAnns = Object.values(entryAnnotations).filter((ann) => ann.targetKey === ayahKey);
       const tafsirStr = ayahAnns.filter((a) => a.type === "tafsir").length > 0
@@ -588,6 +702,7 @@ export const HIZB_AT_START  = ${hizbAtStart};
 export const LINE_GAP_PX    = ${lineGap};
 export const PAGE_ALIGN     = "${pageAlign}";
 export const WORD_GAP_PX    = ${wordGap};
+export const FONT_SIZE_PX   = 32;
 export const HAS_SAJDA      = ${parsed.hasSajda};
 
 export interface WordData {
@@ -602,7 +717,6 @@ export interface WordData {
   hizbMark?: { label: string; symbol: string; fraction: number; hizbIndex: number; hizbFraction: number; positionId: string } | null;
   tafsir?: { title: string; body: string; source: string }[];
   riwaya?: { title: string; body: string; source: string }[];
-  svg: string;
 }
 
 export interface AyahData {
@@ -643,9 +757,9 @@ export const hizbMarks: HizbData[] = [
 ${hizbCode}
 ];
 
-function Word({ id, dataTxt, isAyahMarker, ayahNumber, hizbMark, tafsir, riwaya, svg }: WordData) {
+function Word({ id, dataTxt, isAyahMarker, ayahNumber, hizbMark, tafsir, riwaya }: WordData) {
   return (
-    <div
+    <span
       id={id}
       className={[
         "qword",
@@ -657,34 +771,57 @@ function Word({ id, dataTxt, isAyahMarker, ayahNumber, hizbMark, tafsir, riwaya,
       data-txt={dataTxt}
       data-ayah-number={ayahNumber ?? undefined}
       data-hizb-pos={hizbMark?.positionId}
-      data-has-tafsir={tafsir?.length ? "true" : undefined}
-      data-has-riwaya={riwaya?.length ? "true" : undefined}
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+      lang="ar"
+      dir="rtl"
+      style={{
+        fontFamily: "AALMAGHRIBI, serif",
+        fontSize: FONT_SIZE_PX,
+        direction: "rtl",
+        unicodeBidi: "isolate",
+        whiteSpace: "nowrap",
+        display: "inline-block",
+      }}
+    >
+      {hizbMark && <sup style={{ fontSize: "0.5em", color: "#c9a96e", verticalAlign: "super" }}>{hizbMark.symbol}</sup>}
+      {dataTxt}
+    </span>
   );
 }
 
 function Line({ lineIndex, pageNumber, words }: LineData) {
+  const justify = PAGE_ALIGN === "justify";
   return (
     <div className="qline" data-line={lineIndex} data-page={pageNumber}
-      style={{ marginBottom: LINE_GAP_PX, display: "flex", flexDirection: "row-reverse",
-               justifyContent: PAGE_ALIGN === "justify" ? "space-between" : PAGE_ALIGN,
-               gap: PAGE_ALIGN !== "justify" ? WORD_GAP_PX : 0 }}>
+      lang="ar" dir="rtl"
+      style={{ marginBottom: LINE_GAP_PX, display: "flex", flexDirection: "row",
+               justifyContent: justify ? "space-between" : PAGE_ALIGN,
+               gap: justify ? 0 : WORD_GAP_PX,
+               direction: "rtl", unicodeBidi: "plaintext" }}>
       {words.map((w) => <Word key={w.id} {...w} />)}
     </div>
   );
 }
 
 export function Page${pageNumber}() {
+  // Build interleaved list: surah titles inserted BEFORE the first line of that surah
+  const titledSegments = segments.filter((s) => s.surahTitle);
+  const titleAtLine: Record<number, { surahNumber: number; title: string }[]> = {};
+  for (const seg of titledSegments) {
+    const li = (seg as any).lineStart ?? 0;
+    if (!titleAtLine[li]) titleAtLine[li] = [];
+    titleAtLine[li].push({ surahNumber: seg.surahNumber, title: seg.surahTitle! });
+  }
   return (
     <div className="qpage" id={\`page_${pageNumber}\`} data-page={${pageNumber}} data-hizb-start="${hizbAtStart}"
       style={{ fontFamily: "AALMAGHRIBI, serif" }}>
-      {segments.map((seg) =>
-        seg.surahTitle
-          ? <div key={seg.surahNumber} className="qsurah-title" data-surah={seg.surahNumber}>{seg.surahTitle}</div>
-          : null
-      )}
-      {lines.map((l) => <Line key={\`line-\${l.lineIndex}\`} {...l} />)}
+      {lines.map((l, li) => (
+        <React.Fragment key={\`frag-\${l.lineIndex}\`}>
+          {(titleAtLine[li] ?? []).map((t) => (
+            <div key={t.surahNumber} className="qsurah-title" data-surah={t.surahNumber}>{t.title}</div>
+          ))}
+          <Line {...l} />
+        </React.Fragment>
+      ))}
     </div>
   );
 }
@@ -693,11 +830,50 @@ export default Page${pageNumber};
 `;
 }
 
+
+// Generate a single all-pages TSX file for embedding
+function generateAllInOneTsx(
+  history: HistoryEntry[],
+  annotations: AnnotationStore,
+): string {
+  const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+  const parts: string[] = [];
+
+  parts.push(`// AUTO-GENERATED — All Pages Mushaf (${sorted.length} pages)
+// Generated: ${new Date().toISOString()}
+import React from "react";
+`);
+
+  for (const e of sorted) {
+    const tsx = generateTsx(
+      e.parsed, e.searchOverrides, e.copyOverrides ?? {},
+      annotations[e.id] ?? {}, e.pageAlign ?? "justify", e.wordGap ?? 0,
+    );
+    // Strip the import React line and make the export local
+    const stripped = tsx
+      .replace(/^import React from "react";\n/m, "")
+      .replace(/^export (const|interface|function)/mg, "$1")
+      .replace(/^export default /mg, "// default: ");
+    parts.push(`// ════════ Page ${e.pageNumber} ════════`);
+    parts.push(stripped);
+  }
+
+  // Combined page registry
+  parts.push(`
+// ════════ Page Registry ════════
+export const MUSHAF_ALL_PAGES = [
+${sorted.map((e) => `  { pageNumber: ${e.pageNumber}, surahNumbers: [${e.surahNumbers.join(",")}], label: ${JSON.stringify(e.label)} }`).join(",\n")}
+];
+`);
+
+  return parts.join("\n\n");
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // MUSHAF MANAGER GENERATOR
 // ══════════════════════════════════════════════════════════════════════════════
 
-function generateMushafManager(entries: HistoryEntry[], allOffsets: Record<string, OffsetMap>, globalLineGap: number): string {
+function generateMushafManager(entries: HistoryEntry[]): string {
   const sorted = [...entries].sort((a, b) => a.pageNumber - b.pageNumber);
   const imports = sorted.map((e) =>
     `import { lines as p${e.pageNumber}Lines, segments as p${e.pageNumber}Segs, hizbMarks as p${e.pageNumber}Hizb, HIZB_AT_START as h${e.pageNumber}, LINE_GAP_PX as g${e.pageNumber} } from "./pages/Page${e.pageNumber}";`
@@ -705,11 +881,7 @@ function generateMushafManager(entries: HistoryEntry[], allOffsets: Record<strin
   const pagesArray = sorted.map((e) =>
     `  { pageNumber: ${e.pageNumber}, surahNumbers: [${e.surahNumbers.join(", ")}], label: ${JSON.stringify(e.label)}, lines: p${e.pageNumber}Lines, segments: p${e.pageNumber}Segs, hizbMarks: p${e.pageNumber}Hizb, hizbAtStart: h${e.pageNumber}, lineGap: g${e.pageNumber} }`
   ).join(",\n");
-  const offsetsObj = sorted.map((e) => {
-    const om = allOffsets[e.id] ?? {};
-    const f  = Object.fromEntries(Object.entries(om).filter(([, v]) => v.x !== 0 || v.y !== 0));
-    return `  ${e.pageNumber}: ${JSON.stringify(f)}`;
-  }).join(",\n");
+
 
   return `// AUTO-GENERATED — MushafManager
 // Pages: ${sorted.map((e) => e.pageNumber).join(", ")}
@@ -736,24 +908,7 @@ export function MushafManager() {
   const [idx, setIdx] = useState(0);
   const page = MUSHAF_PAGES[idx];
 
-  useEffect(() => {
-    if (!page) return;
-    const offsets = WORD_OFFSETS[page.pageNumber] ?? {};
-    for (const line of page.lines) {
-      for (const w of line.words) {
-        const el = document.getElementById(w.id);
-        if (!el) continue;
-        if (offsets[w.id]) {
-          const { x, y } = offsets[w.id];
-          const vb = el.querySelector("svg")?.getAttribute("viewBox");
-          let vbW = 1000; let vbH = 2300;
-          if (vb) { const p = vb.trim().split(/[\\s,]+/).map(Number); if (p.length >= 4) { vbW = Math.abs(p[2]); vbH = Math.abs(p[3]); } }
-          el.style.position = "relative";
-          el.style.transform = \`translate(\${(x/vbW*100).toFixed(4)}%, \${(y/vbH*100).toFixed(4)}%)\`;
-        } else { el.style.position = ""; el.style.transform = ""; }
-      }
-    }
-  }, [idx]);
+
 
   if (!page) return <div>No pages.</div>;
   const go = (i: number) => setIdx(Math.max(0, Math.min(MUSHAF_PAGES.length - 1, i)));
@@ -779,11 +934,14 @@ export function MushafManager() {
         {page.lines.map((line: any) => (
           <div key={line.lineIndex} className="qline" style={{ marginBottom: page.lineGap }}>
             {line.words.map((w: any) => (
-              <div key={w.id} id={w.id}
-                className={["qword", w.isAyahMarker ? "qword--ayah-marker" : "", w.tafsir?.length ? "qword--has-tafsir" : "", w.riwaya?.length ? "qword--has-riwaya" : ""].filter(Boolean).join(" ")}
-                data-txt={w.dataTxt} data-hizb-pos={w.hizbMark?.positionId}
-                dangerouslySetInnerHTML={{ __html: w.svg }}
-              />
+              <span key={w.id} id={w.id}
+                className={["qword", w.isAyahMarker ? "qword--ayah-marker" : "", w.tafsir?.length ? "qword--has-tafsir" : ""].filter(Boolean).join(" ")}
+                data-txt={w.dataTxt}
+                lang="ar" dir="rtl"
+                style={{ fontFamily: "AALMAGHRIBI, serif", fontSize: page.fontSize ?? 32, direction: "rtl", unicodeBidi: "isolate", whiteSpace: "nowrap", display: "inline-block", color: w.isAyahMarker ? "#c9a96e" : "inherit" }}
+              >
+                {w.dataTxt}
+              </span>
             ))}
           </div>
         ))}
@@ -811,45 +969,7 @@ interface WordMeta {
   isAyahMarker: boolean; hizbMark: HizbMark | null;
 }
 
-function buildWordMetas(parsed: ParsedPage, displayH: number) {
-  const allWords = parsed.lines.flatMap((l) => l.words).filter((w) => w.svgCompressed || w.svgRaw);
-  const metas: WordMeta[] = allWords.map((w) => {
-    const svg = w.svgCompressed || w.svgRaw;
-    const vbMatch = svg.match(/viewBox="([^"]+)"/);
-    let vbW = 100; let vbH = 2300;
-    if (vbMatch) {
-      const parts = vbMatch[1].trim().split(/[\s,]+/).map(Number);
-      if (parts.length >= 4) { vbW = Math.abs(parts[2]); vbH = Math.abs(parts[3]); }
-    }
-    const uid = w.wid !== null ? `word_${w.wid}_page_${parsed.pageNumber}` : `word_unk`;
-    return { wordId: uid, dataTxt: w.dataTxt, svg, vbW, vbH, displayW: Math.max(4, Math.round(displayH * (vbW / vbH))), surahNumber: w.surahNumber, aid: w.aid, isAyahMarker: w.isAyahMarker, hizbMark: w.hizbMark };
-  });
-  const lineGroups: WordMeta[][] = [];
-  let idx2 = 0;
-  for (const line of parsed.lines) {
-    const count = line.words.filter((w) => w.svgCompressed || w.svgRaw).length;
-    lineGroups.push(metas.slice(idx2, idx2 + count));
-    idx2 += count;
-  }
-  return { metas, lineGroups };
-}
 
-function generateOffsetCss(offsets: OffsetMap, pageNumber: number, surahNumbers: number[], lineGroups: WordMeta[][], lineGap: number): string {
-  const entries = Object.entries(offsets).filter(([, o]) => o.x !== 0 || o.y !== 0);
-  const wm = new Map<string, { vbW: number; vbH: number }>();
-  for (const g of lineGroups) for (const m of g) wm.set(m.wordId, { vbW: m.vbW, vbH: m.vbH });
-
-  const header = `/* Page ${pageNumber} | Surah ${surahNumbers.join(",")} | lineGap: ${lineGap}px */\n\n.qpage[data-page="${pageNumber}"] .qword { position: relative; }\n.qpage[data-page="${pageNumber}"] .qline { margin-bottom: ${lineGap}px; }\n\n`;
-  if (entries.length === 0) return header + `/* No word offsets */\n`;
-
-  const rules = entries.map(([wid, offset]) => {
-    const m = wm.get(wid);
-    const xPct = m ? ((offset.x / m.vbW) * 100).toFixed(4) : "0";
-    const yPct = m ? ((offset.y / m.vbH) * 100).toFixed(4) : "0";
-    return `/* ${wid} Δx:${offset.x.toFixed(1)} Δy:${offset.y.toFixed(1)} */\n#${wid} { transform: translate(${xPct}%, ${yPct}%); }`;
-  }).join("\n\n");
-  return header + rules + "\n";
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // STORAGE: IndexedDB for pages (unlimited) + localStorage for settings
@@ -864,7 +984,7 @@ function generateOffsetCss(offsets: OffsetMap, pageNumber: number, surahNumbers:
 const IDB_NAME    = "qproc_db";
 const IDB_VERSION = 1;
 const IDB_STORE   = "pages";
-const SETTINGS_KEY = "qproc_settings_v14";
+const SETTINGS_KEY = "qproc_settings_v16";
 
 // ── IndexedDB helpers ────────────────────────────────────────────────────────
 
@@ -936,18 +1056,15 @@ async function idbPutMany(entries: HistoryEntry[]): Promise<void> {
 // ── Settings (localStorage, lightweight) ─────────────────────────────────────
 
 interface Settings {
-  allOffsets:    Record<string, OffsetMap>;
   allColors:     Record<string, ColorMap>;
   annotations:   AnnotationStore;
   lineGap:       number;
   hizbCursor:    number;
   lastPageNumber: number;
-  svgoFloatPrec: number;
-  svgoMultipass: boolean;
 }
 
 function defaultSettings(): Settings {
-  return { allOffsets: {}, allColors: {}, annotations: {}, lineGap: 4, hizbCursor: 0, lastPageNumber: 1, svgoFloatPrec: 3, svgoMultipass: true };
+  return { allColors: {}, annotations: {}, lineGap: 4, hizbCursor: 0, lastPageNumber: 1, hafsWarshMap: {} };
 }
 
 function loadSettings(): Settings {
@@ -957,8 +1074,7 @@ function loadSettings(): Settings {
     const p = JSON.parse(raw) as Partial<Settings>;
     const d = defaultSettings();
     return {
-      allOffsets:     p.allOffsets  ?? d.allOffsets,
-      allColors:      p.allColors   ?? d.allColors,
+          allColors:      p.allColors   ?? d.allColors,
       annotations:    p.annotations ?? d.annotations,
       lineGap:        typeof p.lineGap === "number"      ? p.lineGap      : d.lineGap,
       hizbCursor:     typeof p.hizbCursor === "number"   ? p.hizbCursor   : d.hizbCursor,
@@ -978,13 +1094,7 @@ function saveSettings(s: Settings) {
   }, 300);
 }
 
-// ── Keep AppState type for backup compatibility ───────────────────────────────
-function defaultState(): AppState {
-  return { history: [], allOffsets: {}, allColors: {}, annotations: {}, lineGap: 4, hizbCursor: 0, lastPageNumber: 1, svgoFloatPrec: 3, svgoMultipass: true };
-}
 
-function loadAppState(): AppState { return defaultState(); }  // legacy — not used
-function saveAppState(_state: AppState) {}  // legacy — not used
 
 // ══════════════════════════════════════════════════════════════════════════════
 // BACKUP — Export / Import full app state as JSON
@@ -1073,15 +1183,12 @@ function importBackup(file: File): Promise<{ pages: HistoryEntry[]; settings: Se
         const extractSettings = (src: any): Settings => {
           const s = (src.settings ?? src) as Partial<Settings>;
           return {
-            allOffsets:     s.allOffsets  ?? d.allOffsets,
-            allColors:      s.allColors   ?? d.allColors,
+                  allColors:      s.allColors   ?? d.allColors,
             annotations:    s.annotations ?? d.annotations,
             lineGap:        typeof s.lineGap === "number"        ? s.lineGap        : d.lineGap,
             hizbCursor:     typeof s.hizbCursor === "number"     ? s.hizbCursor     : d.hizbCursor,
             lastPageNumber: s.lastPageNumber ?? d.lastPageNumber,
-            svgoFloatPrec:  s.svgoFloatPrec  ?? d.svgoFloatPrec,
-            svgoMultipass:  s.svgoMultipass  ?? d.svgoMultipass,
-          };
+                                  };
         };
 
         // V3+ single or chunked
@@ -1154,7 +1261,6 @@ function parseCopyTextFile(raw: string, surahSequence: number[]): Record<string,
   return map;
 }
 
-
 function guessPageNumber(filename: string): number {
   // Match: page_2, page2, p2, 002, page_002, etc.
   const m = filename.match(/(?:page[_\-\s]?)?(\d+)/i);
@@ -1170,37 +1276,18 @@ async function processOnePage(
   pageNumber: number,
   surahNumbers: number[],
   hizbCursor: number,
-  fp: number,
-  mp: boolean,
-  onProgress?: (done: number, total: number) => void,
-): Promise<{ entry: Omit<HistoryEntry, "searchOverrides">; hizbCursorOut: number }> {
-  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
-
-  const { result: base, hizbCursorOut } = parseQuranHtml(html, pageNumber, surahNumbers, hizbCursor);
-  const allWords = base.lines.flatMap((l) => l.words).filter((w) => w.svgRaw);
-
-  const cache = new Map<string, string>();
-  let origBytes = 0; let compBytes = 0; let done = 0;
-
-  for (let i = 0; i < allWords.length; i += 5) {
-    const batch = allWords.slice(i, i + 5);
-    for (const word of batch) {
-      origBytes += new Blob([word.svgRaw]).size;
-      if (cache.has(word.svgRaw)) { word.svgCompressed = cache.get(word.svgRaw)!; }
-      else { word.svgCompressed = compressWithSvgo(word.svgRaw, fp, mp); cache.set(word.svgRaw, word.svgCompressed); }
-      compBytes += new Blob([word.svgCompressed]).size;
-      done++;
-    }
-    onProgress?.(done, allWords.length);
-    await tick();
-  }
-
-  const parsed: ParsedPage = { ...base, originalBytes: origBytes, compressedBytes: compBytes };
-  const tsx = generateTsx(parsed, {}, {}, {});
+): Promise<{ entry: Omit<HistoryEntry, "searchOverrides" | "copyOverrides" | "wordEdits">; hizbCursorOut: number }> {
+  const { result: parsed, hizbCursorOut } = parseQuranHtml(html, pageNumber, surahNumbers, hizbCursor);
+  const tsx = generateTsx(parsed);
   const label = `Page ${pageNumber} — Surah ${surahNumbers.join(", ")}`;
-
+  const defaults = getDefaultLayout(pageNumber);
   return {
-    entry: { id: `p${pageNumber}_${Date.now()}`, pageNumber, surahNumbers, label, parsed, tsx, savedAt: Date.now() },
+    entry: {
+      id: `p${pageNumber}_${Date.now()}`, pageNumber, surahNumbers,
+      label, parsed, tsx, savedAt: Date.now(),
+      pageAlign: defaults.pageAlign, wordGap: defaults.wordGap,
+      wordMargin: 0, fontSize: 32, lineGap: 8,
+    },
     hizbCursorOut,
   };
 }
@@ -1221,6 +1308,7 @@ async function processOnePage(
 // Response: array of { tafseer_id, tafseer_name, ayah_url, ayah_number, text }
 // The API supports CORS but may be blocked from localhost.
 // We try the direct URL first, then fall through 3 CORS proxies.
+
 async function fetchTafsirRange(
   surah: number, tafsirId: number, startAyah: number, endAyah: number
 ): Promise<Record<number, string>> {
@@ -1286,6 +1374,192 @@ function warshAudioUrl(surah: number, ayah: number, reciter: string = DEFAULT_WA
   const s = String(surah).padStart(3, "0");
   const a = String(ayah).padStart(3, "0");
   return `https://everyayah.com/data/${path}/${s}${a}.mp3`;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WORD EDITOR — click words to select/edit, palette for insertion
+// ══════════════════════════════════════════════════════════════════════════════
+
+interface WordEditorProps {
+  entry: HistoryEntry;
+  wordEdits: Record<string, string>;
+  onWordEdit: (wordId: string, newTxt: string) => void;
+  pageAlign: HistoryEntry["pageAlign"];
+  wordGap: number;
+  fontSize: number;
+  lineGap: number;
+  onPageAlignChange: (v: HistoryEntry["pageAlign"]) => void;
+  onWordGapChange: (v: number) => void;
+  onFontSizeChange: (v: number) => void;
+  onLineGapChange: (v: number) => void;
+  onApplyToAll: (field: "wordGap" | "fontSize" | "lineGap", value: number) => void;
+}
+
+function WordEditor({ entry, wordEdits, onWordEdit, pageAlign, wordGap, fontSize, lineGap,
+  onPageAlignChange, onWordGapChange, onFontSizeChange, onLineGapChange, onApplyToAll }: WordEditorProps) {
+  const [selectedWordId, setSelectedWordId] = useState<string | null>(null);
+  const [editingWordId, setEditingWordId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [showPalette, setShowPalette] = useState(true);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const allWords = entry.parsed.lines.flatMap((l, li) => l.words.map((w) => ({ w, li })));
+
+  const getWordId = (w: WordToken, li: number) =>
+    w.wid !== null ? `word_${w.wid}_page_${entry.pageNumber}` : `word_p${entry.pageNumber}_l${li}`;
+
+  const startEditing = (wordId: string, cur: string) => {
+    setEditingWordId(wordId); setEditValue(cur);
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  const commitEdit = () => {
+    if (editingWordId) { onWordEdit(editingWordId, editValue); setEditingWordId(null); }
+  };
+
+  const insertChar = (ch: string) => {
+    if (!editingWordId && selectedWordId) {
+      const item = allWords.find(({ w, li }) => getWordId(w, li) === selectedWordId);
+      startEditing(selectedWordId, (wordEdits[selectedWordId] ?? item?.w.dataTxt ?? "") + ch);
+      return;
+    }
+    if (editingWordId && inputRef.current) {
+      const pos = inputRef.current.selectionStart ?? editValue.length;
+      const nv = editValue.slice(0, pos) + ch + editValue.slice(pos);
+      setEditValue(nv);
+      setTimeout(() => inputRef.current?.setSelectionRange(pos + ch.length, pos + ch.length), 0);
+    }
+  };
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (!selectedWordId || editingWordId) return;
+      const ids = allWords.map(({ w, li }) => getWordId(w, li));
+      const idx = ids.indexOf(selectedWordId);
+      if (idx === -1) return;
+      if (e.key === "ArrowRight") { e.preventDefault(); const n = ids[idx - 1]; if (n) setSelectedWordId(n); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); const n = ids[idx + 1]; if (n) setSelectedWordId(n); }
+      else if (e.key === " ") { e.preventDefault(); const it = allWords.find(({ w, li }) => getWordId(w, li) === selectedWordId); startEditing(selectedWordId, (wordEdits[selectedWordId] ?? it?.w.dataTxt ?? "") + " "); }
+      else if (e.key === "Enter") { e.preventDefault(); const it = allWords.find(({ w, li }) => getWordId(w, li) === selectedWordId); startEditing(selectedWordId, wordEdits[selectedWordId] ?? it?.w.dataTxt ?? ""); }
+      else if (e.key === "Escape") { setSelectedWordId(null); setEditingWordId(null); }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [selectedWordId, editingWordId, allWords, wordEdits]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* Toolbar */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", padding: "8px 10px", background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8 }}>
+        <span style={SP.dim}>Align:</span>
+        {([ ["justify","⁞⁞","ممتد"],["center","⊟","وسط"],["flex-end","⊡","يمين"],["flex-start","⊞","يسار"] ] as const).map(([v,icon,label]) => (
+          <button key={v} title={label} style={{ ...SP.btn, ...(pageAlign === v ? SP.btnOn : {}), padding: "2px 8px" }} onClick={() => onPageAlignChange(v)}>{icon}</button>
+        ))}
+        <div style={{ width: 1, height: 20, background: "#2a2f3e" }} />
+        <span style={SP.dim}>Font:</span>
+        <input type="number" min={10} max={80} value={fontSize} onChange={(e) => onFontSizeChange(parseInt(e.target.value)||32)} style={{ ...SP.numInput, width: 52 }} />
+        <button style={{ ...SP.smallBtn, fontSize: 9 }} onClick={() => onApplyToAll("fontSize", fontSize)}>all</button>
+        <div style={{ width: 1, height: 20, background: "#2a2f3e" }} />
+        <span style={SP.dim}>Gap:</span>
+        <input type="number" min={-30} max={200} value={wordGap} onChange={(e) => onWordGapChange(parseInt(e.target.value)||0)} style={{ ...SP.numInput, width: 52 }} />
+        <button style={{ ...SP.smallBtn, fontSize: 9 }} onClick={() => onApplyToAll("wordGap", wordGap)}>all</button>
+        <div style={{ width: 1, height: 20, background: "#2a2f3e" }} />
+        <span style={SP.dim}>Line:</span>
+        <input type="number" min={-20} max={60} value={lineGap} onChange={(e) => onLineGapChange(parseInt(e.target.value)||0)} style={{ ...SP.numInput, width: 52 }} />
+        <button style={{ ...SP.smallBtn, fontSize: 9 }} onClick={() => onApplyToAll("lineGap", lineGap)}>all</button>
+        <div style={{ flex: 1 }} />
+        <button style={{ ...SP.btn, ...(showPalette ? SP.btnOn : {}) }} onClick={() => setShowPalette(!showPalette)}>🔤</button>
+        {selectedWordId && <button style={{ ...SP.btn, color: "#f87171" }} onClick={() => { const it = allWords.find(({ w, li }) => getWordId(w,li)===selectedWordId); onWordEdit(selectedWordId, it?.w.dataTxt??""); setSelectedWordId(null); setEditingWordId(null); }}>↺ Reset</button>}
+      </div>
+
+      {/* Word edit box */}
+      {selectedWordId && (
+        <div style={{ background: "#0f1117", border: "1px solid #c9a96e44", borderRadius: 8, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <code style={{ fontSize: 10, color: "#7dd3fc", flex: 1 }}>{selectedWordId}</code>
+            {editingWordId !== selectedWordId && <button style={{ ...SP.btn, ...SP.btnGold }} onClick={() => { const it = allWords.find(({w,li}) => getWordId(w,li)===selectedWordId); startEditing(selectedWordId, wordEdits[selectedWordId] ?? it?.w.dataTxt ?? ""); }}>✏️ Edit</button>}
+            <button style={SP.btn} onClick={() => { setSelectedWordId(null); setEditingWordId(null); }}>✕</button>
+          </div>
+          {editingWordId === selectedWordId ? (
+            <div style={{ display: "flex", gap: 6 }}>
+              <input ref={inputRef} value={editValue} onChange={(e) => setEditValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key==="Enter") commitEdit(); if (e.key==="Escape") setEditingWordId(null); }}
+                style={{ ...SP.numInput, flex: 1, fontSize, fontFamily: "AALMAGHRIBI, serif", direction: "rtl", textAlign: "right", height: 42, padding: "6px 12px" }} dir="rtl" />
+              <button style={{ ...SP.btn, ...SP.btnGold }} onClick={commitEdit}>✅</button>
+              <button style={SP.btn} onClick={() => setEditingWordId(null)}>✕</button>
+            </div>
+          ) : (
+            <div style={{ background: "#0a0c10", border: "1px solid #2a2f3e", borderRadius: 6, padding: "8px 14px", fontSize, fontFamily: "AALMAGHRIBI, serif", direction: "rtl", color: "#e8e6e0", cursor: "pointer" }}
+              onDoubleClick={() => { const it = allWords.find(({w,li}) => getWordId(w,li)===selectedWordId); startEditing(selectedWordId, wordEdits[selectedWordId] ?? it?.w.dataTxt ?? ""); }}>
+              {wordEdits[selectedWordId] ?? allWords.find(({w,li}) => getWordId(w,li)===selectedWordId)?.w.dataTxt ?? ""}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Bulk actions */}
+      <div style={{ display: "flex", gap: 6, padding: "5px 10px", background: "#0a0c10", border: "1px solid #1e2332", borderRadius: 6 }}>
+        <span style={{ fontSize: 9, color: "#6b7280" }}>⚡</span>
+        <button style={SP.smallBtn} onClick={() => { for (const {w,li} of allWords) { const uid=getWordId(w,li); const cur=wordEdits[uid]??w.dataTxt??""; if (!cur.endsWith(" ")) onWordEdit(uid, cur+" "); } }}>Add spaces</button>
+        <button style={SP.smallBtn} onClick={() => { for (const {w,li} of allWords) { const uid=getWordId(w,li); const cur=wordEdits[uid]??w.dataTxt??""; const n=cur.replace(/\s+/g," ").trim(); if (n!==cur) onWordEdit(uid,n); } }}>Normalize</button>
+        <div style={{ flex: 1 }} />
+        <span style={{ fontSize: 9, color: "#4b5563" }}>{Object.keys(wordEdits).length} edited</span>
+        {Object.keys(wordEdits).length > 0 && <button style={{ ...SP.smallBtn, color: "#f87171" }} onClick={() => { if (confirm("Clear all word edits?")) allWords.forEach(({w,li}) => { const uid=getWordId(w,li); if (wordEdits[uid]!==undefined) onWordEdit(uid,w.dataTxt); }); }}>Clear all</button>}
+      </div>
+
+      {/* Palette */}
+      {showPalette && <ArabicCharPalette onInsert={insertChar} />}
+
+      {/* Page canvas */}
+      <div style={{ background: "#08090d", borderRadius: 8, padding: "16px 12px", border: "1px solid #1e2332", direction: "rtl" }} lang="ar" dir="rtl">
+        {entry.parsed.segments.map((seg) =>
+          seg.surahTitle ? <div key={seg.surahNumber} style={{ textAlign: "center", fontFamily: "AALMAGHRIBI, serif", fontSize: fontSize*1.2, color: "#c9a96e", marginBottom: lineGap }}>{seg.surahTitle}</div> : null
+        )}
+        {entry.parsed.lines.map((line, li) => (
+          <div key={li} style={{ display: "flex", flexDirection: "row", justifyContent: pageAlign==="justify" ? "space-between" : pageAlign, gap: pageAlign==="justify" ? 0 : wordGap, marginBottom: lineGap, direction: "rtl", unicodeBidi: "plaintext" }}>
+            {line.words.map((w) => {
+              const uid = getWordId(w, li);
+              const displayTxt = wordEdits[uid] ?? w.dataTxt;
+              const isSel = uid === selectedWordId;
+              const isEdited = wordEdits[uid] !== undefined && wordEdits[uid] !== w.dataTxt;
+              return (
+                <span key={uid} id={uid}
+                  onClick={() => { if (!editingWordId) { setSelectedWordId(isSel ? null : uid); if (isSel) setEditingWordId(null); } }}
+                  onDoubleClick={() => { setSelectedWordId(uid); startEditing(uid, wordEdits[uid] ?? w.dataTxt); }}
+                  title={`${w.dataTxt}${isEdited ? ` → ${wordEdits[uid]}` : ""}${w.hizbMark ? ` [${w.hizbMark.positionId}]` : ""}`}
+                  lang="ar" dir="rtl"
+                  style={{ fontFamily: "AALMAGHRIBI, serif", fontSize, color: w.isAyahMarker ? "#c9a96e" : "#e8e6e0", cursor: "pointer", borderRadius: 3, padding: "1px 3px",
+                    outline: isSel ? "2px solid #c9a96e" : isEdited ? "1px dashed #10b981" : "none",
+                    background: isSel ? "#c9a96e15" : isEdited ? "#10b98108" : "transparent",
+                    position: "relative", whiteSpace: "nowrap", direction: "rtl", unicodeBidi: "isolate", display: "inline-block" }}>
+                  {w.hizbMark && <sup style={{ fontSize: 8, color: "#c9a96e", verticalAlign: "super" }}>{w.hizbMark.symbol}</sup>}
+                  {displayTxt}
+                  {isEdited && <span style={{ position: "absolute", top: -3, right: -3, width: 5, height: 5, borderRadius: "50%", background: "#10b981" }} />}
+                </span>
+              );
+            })}
+          </div>
+        ))}
+        {entry.parsed.hizbMarks.length > 0 && (
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 8, justifyContent: "flex-end" }}>
+            {entry.parsed.hizbMarks.map((h, i) => <span key={i} style={{ background: "#c9a96e22", border: "1px solid #c9a96e44", color: "#c9a96e", borderRadius: 4, padding: "2px 7px", fontSize: 10 }} title={h.positionId}>{h.symbol} {h.label}</span>)}
+          </div>
+        )}
+      </div>
+
+      {Object.keys(wordEdits).length > 0 && (
+        <div style={{ background: "#10b98108", border: "1px solid #10b98130", borderRadius: 7, padding: "8px 12px" }}>
+          <div style={{ fontSize: 10, color: "#10b981", fontWeight: 700, marginBottom: 5 }}>✏️ {Object.keys(wordEdits).length} كلمة معدّلة</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {Object.entries(wordEdits).slice(0, 30).map(([wid, txt]) => (
+              <span key={wid} style={{ background: "#10b98120", color: "#10b981", borderRadius: 3, padding: "1px 6px", fontSize: 11, fontFamily: "AALMAGHRIBI, serif", direction: "rtl" }}>{txt}</span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1593,361 +1867,143 @@ function TafsirAudioPanel({
 // PREVIEWER COMPONENT
 // ══════════════════════════════════════════════════════════════════════════════
 
-function SvgChainPreviewer({
-  parsed, selectedWordId, onSelectWord,
-  offsets, onOffsetChange,
-  colors, onColorChange,
-  annotations, onAnnotationSave, onAnnotationDelete,
-  lineGap, onLineGapChange,
-  pageAlign, onPageAlignChange,
-  wordGap, onWordGapChange,
-  onApplyGapToAll, onApplyWordGapToAll,
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ARABIC CHAR PALETTE — Quick access to Arabic letters/diacritics in edit mode
+// ══════════════════════════════════════════════════════════════════════════════
+
+const ARABIC_CHARS = {
+  "حروف": "ا ب ت ث ج ح خ د ذ ر ز س ش ص ض ط ظ ع غ ف ق ك ل م ن ه و ي ء أ إ آ ؤ ئ ة ى ً ٌ ٍ َ ُ ِ ّ ْ".split(" "),
+  "تشكيل": "َ ُ ِ ً ٌ ٍ ّ ْ ٰ ـ".split(" "),
+  "رموز": "﴾ ﴿ ۞ ۩ ۖ ۗ ۘ ۙ ۚ ۛ ۜ ۝ ۟ ۠ ۡ ۢ ۣ ۤ ۥ ۦ ۧ ۨ ۩".split(" "),
+  "أرقام": "٠ ١ ٢ ٣ ٤ ٥ ٦ ٧ ٨ ٩".split(" "),
+};
+
+function ArabicCharPalette({
+  onInsert,
 }: {
-  parsed: ParsedPage;
-  selectedWordId: string | null;
-  onSelectWord: (id: string | null) => void;
-  offsets: OffsetMap;
-  onOffsetChange: (wordId: string, delta: WordOffset) => void;
-  colors: ColorMap;
-  onColorChange: (wordId: string, color: string) => void;
-  annotations: Record<string, Annotation>;
-  onAnnotationSave: (a: Annotation) => void;
-  onAnnotationDelete: (id: string) => void;
-  lineGap: number;
-  onLineGapChange: (v: number) => void;
-  pageAlign: HistoryEntry["pageAlign"];
-  onPageAlignChange: (v: HistoryEntry["pageAlign"]) => void;
-  wordGap: number;
-  onWordGapChange: (v: number) => void;
-  onApplyGapToAll?: (gap: number) => void;
-  onApplyWordGapToAll?: (gap: number) => void;
+  onInsert: (char: string) => void;
 }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [containerW, setContainerW] = useState(800);
-  const [editMode, setEditMode]     = useState(false);
-  const [editTool, setEditTool]     = useState<"offset" | "color" | "tafsir" | "riwaya">("offset");
-  const [step, setStep]             = useState(10);
-  const [showGrid, setShowGrid]     = useState(false);
-  const [copiedCss, setCopiedCss]   = useState(false);
-  const [svgColor, setSvgColor]     = useState("#ffffff");
-  const [annTarget, setAnnTarget]   = useState<{ key: string; type: "word"|"ayah"|"surah"; label: string } | null>(null);
-  const [annTitle, setAnnTitle]     = useState("");
-  const [annBody, setAnnBody]       = useState("");
-  const [annSource, setAnnSource]   = useState("");
+  const [open, setOpen]       = useState(false);
+  const [tab, setTab]         = useState<keyof typeof ARABIC_CHARS>("حروف");
+  const [favorites, setFaves] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("arabic_palette_faves") ?? "[]"); } catch { return []; }
+  });
+  const [shortcuts, setScs]   = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem("arabic_palette_scs") ?? "{}"); } catch { return {}; }
+  });
+  const [editingSc, setEditingSc] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
 
-  useEffect(() => {
-    const obs = new ResizeObserver(([e]) => setContainerW(e.contentRect.width));
-    if (containerRef.current) obs.observe(containerRef.current);
-    return () => obs.disconnect();
-  }, []);
+  const saveFaves = (f: string[]) => {
+    setFaves(f);
+    localStorage.setItem("arabic_palette_faves", JSON.stringify(f));
+  };
+  const saveScs = (s: Record<string, string>) => {
+    setScs(s);
+    localStorage.setItem("arabic_palette_scs", JSON.stringify(s));
+  };
 
-  useEffect(() => {
-    if (!editMode || editTool !== "offset" || !selectedWordId) return;
-    const handler = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === "INPUT" || (e.target as HTMLElement).tagName === "TEXTAREA") return;
-      const map: Record<string, WordOffset> = { ArrowLeft: { x: -step, y: 0 }, ArrowRight: { x: step, y: 0 }, ArrowUp: { x: 0, y: -step }, ArrowDown: { x: 0, y: step } };
-      if (map[e.key]) { e.preventDefault(); onOffsetChange(selectedWordId, map[e.key]); }
-      if (e.key === "Escape") onSelectWord(null);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [editMode, editTool, selectedWordId, step, onOffsetChange, onSelectWord]);
+  const handleInsert = (ch: string) => {
+    onInsert(ch);
+    navigator.clipboard.writeText(ch).catch(() => {});
+    setCopied(ch);
+    setTimeout(() => setCopied(null), 800);
+  };
 
-  const DISPLAY_H = Math.max(28, Math.round(containerW * 0.10));
-  const { lineGroups } = buildWordMetas(parsed, DISPLAY_H);
-  const cssText    = generateOffsetCss(offsets, parsed.pageNumber, parsed.surahNumbers, lineGroups, lineGap);
-  const hasOffsets = Object.values(offsets).some((o) => o.x !== 0 || o.y !== 0);
-  const selOffset  = selectedWordId ? (offsets[selectedWordId] ?? { x: 0, y: 0 }) : null;
-  const selColor   = selectedWordId ? (colors[selectedWordId] ?? "") : "";
+  const toggleFave = (ch: string) => {
+    saveFaves(favorites.includes(ch) ? favorites.filter((f) => f !== ch) : [...favorites, ch]);
+  };
 
-  const resetSel = () => { if (!selectedWordId) return; const cur = offsets[selectedWordId] ?? { x: 0, y: 0 }; onOffsetChange(selectedWordId, { x: -cur.x, y: -cur.y }); };
+  const CharBtn = ({ ch }: { ch: string }) => {
+    const isFave = favorites.includes(ch);
+    const sc     = Object.entries(shortcuts).find(([, v]) => v === ch)?.[0];
+    return (
+      <div style={{ position: "relative", display: "inline-flex" }}>
+        <button
+          title={sc ? `Shortcut: ${sc}` : ch}
+          style={{ width: 34, height: 34, background: copied === ch ? "#c9a96e33" : "#1e2332", border: `1px solid ${isFave ? "#c9a96e66" : "#2a2f3e"}`, borderRadius: 5, color: "#e8e6e0", fontSize: 18, fontFamily: "AALMAGHRIBI, serif", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+          onClick={() => handleInsert(ch)}>
+          {ch}
+        </button>
+        <button
+          title="Favorite"
+          style={{ position: "absolute", top: -4, right: -4, width: 12, height: 12, background: isFave ? "#c9a96e" : "#2a2f3e", border: "none", borderRadius: "50%", cursor: "pointer", fontSize: 7, color: "#0f1117", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 5 }}
+          onClick={(e) => { e.stopPropagation(); toggleFave(ch); }}>
+          ★
+        </button>
+        {editingSc === ch ? (
+          <input autoFocus style={{ position: "absolute", bottom: -22, left: 0, width: 34, fontSize: 10, background: "#0f1117", border: "1px solid #c9a96e", borderRadius: 3, color: "#e8e6e0", textAlign: "center", zIndex: 10 }}
+            placeholder="key"
+            onKeyDown={(e) => {
+              if (e.key !== "Escape" && e.key !== "Enter" && e.key.length === 1) {
+                const s = { ...shortcuts, [e.key]: ch };
+                saveScs(s); setEditingSc(null);
+              } else if (e.key === "Escape" || e.key === "Enter") { setEditingSc(null); }
+            }}
+            onBlur={() => setEditingSc(null)} />
+        ) : (
+          <button
+            title="Set shortcut"
+            style={{ position: "absolute", bottom: -4, left: -4, width: 12, height: 12, background: "#2a2f3e", border: "none", borderRadius: "50%", cursor: "pointer", fontSize: 7, color: "#9ca3af" }}
+            onClick={(e) => { e.stopPropagation(); setEditingSc(ch); }}>
+            ⌨
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const chars = tab === "حروف" && favorites.length > 0
+    ? [...favorites, ...ARABIC_CHARS[tab].filter((c) => !favorites.includes(c))]
+    : ARABIC_CHARS[tab] ?? [];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-
-      {/* Toolbar */}
-      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-        <button style={{ ...SP.btn, ...(editMode ? SP.btnOn : {}) }}
-          onClick={() => { setEditMode(!editMode); if (editMode) onSelectWord(null); }}>
-          {editMode ? "✏️ Edit ON" : "✏️ Edit"}
-        </button>
-
-        {editMode && (
-          <>
-            <div style={SP.toolGroup}>
-              {(["offset","color","tafsir","riwaya"] as const).map((t) => (
-                <button key={t} style={{ ...SP.btn, ...(editTool === t ? SP.btnOn : {}), borderRadius: 0, borderRight: "1px solid #2a2f3e" }}
-                  onClick={() => setEditTool(t)}>
-                  {t === "offset" ? "⬡ Offset" : t === "color" ? "🎨 Color" : t === "tafsir" ? "📖 تفسير" : "📜 رواية"}
-                </button>
-              ))}
-            </div>
-
-            {editTool === "offset" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <span style={SP.dim}>Step:</span>
-                {[1, 5, 10, 20, 50].map((s) => (
-                  <button key={s} style={{ ...SP.smallBtn, ...(step === s ? SP.btnOn : {}) }} onClick={() => setStep(s)}>{s}</button>
-                ))}
-              </div>
-            )}
-
-            {editTool === "color" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={SP.dim}>Fill:</span>
-                <input type="color" value={svgColor}
-                  onChange={(e) => { setSvgColor(e.target.value); if (selectedWordId) onColorChange(selectedWordId, e.target.value); }}
-                  style={{ width: 30, height: 24, border: "none", padding: 0, cursor: "pointer", background: "none" }} />
-                {["#ffffff","#f59e0b","#ef4444","#3b82f6","#10b981","#a855f7"].map((c) => (
-                  <button key={c} style={{ width: 18, height: 18, background: c, border: `2px solid ${svgColor === c ? "#c9a96e" : "#2a2f3e"}`, borderRadius: 3, cursor: "pointer" }}
-                    onClick={() => { setSvgColor(c); if (selectedWordId) onColorChange(selectedWordId, c); }} />
-                ))}
-                {Object.keys(colors).length > 0 && <button style={SP.btn} onClick={() => { for (const id of Object.keys(colors)) onColorChange(id, ""); }}>↺ All</button>}
-              </div>
-            )}
-
-            <button style={{ ...SP.btn, ...(showGrid ? SP.btnOn : {}) }} onClick={() => setShowGrid(!showGrid)}>▦</button>
-
-            {/* Line gap — allow negative */}
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={SP.dim}>Gap:</span>
-              <input type="number" min={-30} max={50} value={lineGap}
-                onChange={(e) => onLineGapChange(parseInt(e.target.value) || 0)}
-                style={{ ...SP.numInput, width: 54 }} />
-              <span style={SP.dim}>px</span>
-              <button style={{ ...SP.smallBtn, fontSize: 9 }}
-                title="Apply this gap to ALL pages"
-                onClick={() => onApplyGapToAll?.(lineGap)}>all</button>
-            </div>
-
-            {/* Word width % — controls SVG container width relative to auto */}
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={SP.dim}>Width %:</span>
-              <input type="number" min={-50} max={100} value={wordGap}
-                onChange={(e) => onWordGapChange(parseInt(e.target.value) || 0)}
-                style={{ ...SP.numInput, width: 54 }} />
-              <span style={{ ...SP.dim, fontSize: 9, color: wordGap === 0 ? "#4b5563" : "#c9a96e" }}>
-                {wordGap === 0 ? "auto" : wordGap > 0 ? `+${wordGap}%` : `${wordGap}%`}
-              </span>
-              <button style={{ ...SP.smallBtn, fontSize: 9 }}
-                title="Apply this width to ALL pages"
-                onClick={() => onApplyWordGapToAll?.(wordGap)}>all</button>
-            </div>
-
-            {/* Page alignment — per page, saved into TSX */}
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={SP.dim}>Align:</span>
-              <div style={{ display: "flex", gap: 2 }}>
-                {([["justify","⁞⁞","ممتد"],["center","⊟","وسط"],["flex-end","⊡","يمين"],["flex-start","⊞","يسار"]] as const).map(([v, icon, label]) => (
-                  <button key={v} title={label}
-                    style={{ ...SP.smallBtn, ...(pageAlign === v ? SP.btnOn : {}), padding: "2px 7px", fontSize: 13 }}
-                    onClick={() => onPageAlignChange(v)}>{icon}</button>
-                ))}
-              </div>
-              <span style={{ ...SP.dim, fontSize: 9, color: pageAlign === "justify" ? "#c9a96e" : "#4b5563" }}>
-                {pageAlign === "justify" ? "ممتد★" : pageAlign === "center" ? "وسط" : pageAlign === "flex-end" ? "يمين" : "يسار"}
-              </span>
-            </div>
-          </>
-        )}
-
-        <div style={{ flex: 1 }} />
-        {hasOffsets && (
-          <>
-            <button style={SP.btn} onClick={() => { for (const [id, o] of Object.entries(offsets)) if (o.x !== 0 || o.y !== 0) onOffsetChange(id, { x: -o.x, y: -o.y }); }}>↺ Offsets</button>
-            <button style={{ ...SP.btn, ...SP.btnGold }} onClick={() => { navigator.clipboard.writeText(cssText).then(() => { setCopiedCss(true); setTimeout(() => setCopiedCss(false), 2000); }); }}>
-              {copiedCss ? "✅" : "📋 CSS"}
-            </button>
-            <button style={{ ...SP.btn, ...SP.btnGold }} onClick={() => dl(cssText, `page${parsed.pageNumber}_offsets.css`)}>💾 CSS</button>
-          </>
-        )}
-      </div>
-
-      {/* Canvas */}
-      <div ref={containerRef} style={{ width: "100%", background: "#08090d", borderRadius: 8, padding: "10px 8px", border: "1px solid #1e2332", position: "relative", overflow: "visible" }}>
-        {showGrid && (
-          <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 0, backgroundImage: "linear-gradient(rgba(255,255,255,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.02) 1px,transparent 1px)", backgroundSize: `${DISPLAY_H}px ${DISPLAY_H}px` }} />
-        )}
-
-        {lineGroups.map((group, li) => (
-          <div key={li} style={{ display: "flex", flexDirection: "row-reverse", justifyContent: pageAlign === "justify" ? "space-between" : pageAlign, alignItems: "flex-end", marginBottom: lineGap, height: DISPLAY_H, position: "relative", zIndex: 1, gap: pageAlign === "justify" ? 0 : wordGap }}>
-            {group.map((m, wi) => {
-              const offset = offsets[m.wordId] ?? { x: 0, y: 0 };
-              const wColor = colors[m.wordId] ?? "";
-              const isSel  = m.wordId === selectedWordId;
-              const hasOff = offset.x !== 0 || offset.y !== 0;
-              const hasTafsir = Object.values(annotations).some((a) => a.type === "tafsir" && a.targetKey === m.wordId);
-              const hasRiwaya = Object.values(annotations).some((a) => a.type === "riwaya" && a.targetKey === m.wordId);
-              const ayahKey   = m.aid !== null ? `ayah_${m.surahNumber}_${m.aid}` : null;
-              const hasTafsirAyah = ayahKey ? Object.values(annotations).some((a) => a.type === "tafsir" && a.targetKey === ayahKey) : false;
-
-              const pxX = (offset.x / m.vbH) * DISPLAY_H;
-              const pxY = (offset.y / m.vbH) * DISPLAY_H;
-              const svgToRender = wColor ? injectSvgColor(m.svg, wColor) : m.svg;
-
-              const outline = isSel ? "2px solid #c9a96e"
-                : hasTafsir ? "2px solid #10b98188"
-                : hasRiwaya ? "2px solid #a855f788"
-                : hasTafsirAyah ? "1px dashed #3b82f660"
-                : hasOff ? "1px dashed #3b82f640"
-                : "none";
-
-              return (
-                <div key={wi}
-                  title={`${m.dataTxt}${m.hizbMark ? ` [${m.hizbMark.positionId}]` : ""}${hasTafsir ? " 📖" : ""}${hasRiwaya ? " 📜" : ""}`}
-                  onClick={() => {
-                    const newSel = isSel ? null : m.wordId;
-                    onSelectWord(newSel);
-                    if (editTool === "color" && newSel) { onColorChange(newSel, svgColor); return; }
-                    if ((editTool === "tafsir" || editTool === "riwaya") && newSel) {
-                      setAnnTarget({ key: newSel, type: "word", label: m.dataTxt });
-                      setAnnTitle(""); setAnnBody(""); setAnnSource("");
-                    }
-                  }}
-                  style={{ width: Math.max(4, Math.round(m.displayW * (1 + wordGap / 100))), height: DISPLAY_H, flexShrink: 0, cursor: editMode ? "pointer" : "default", position: "relative", zIndex: isSel ? 10 : 1, transform: `translate(${pxX}px,${pxY}px)`, outline, outlineOffset: -1, borderRadius: 2, background: isSel ? "#c9a96e10" : "transparent" }}>
-                  {(hasTafsir || hasRiwaya) && (
-                    <div style={{ position: "absolute", top: 1, right: 1, display: "flex", gap: 1, zIndex: 20, pointerEvents: "none" }}>
-                      {hasTafsir && <div style={{ width: 4, height: 4, borderRadius: "50%", background: "#10b981" }} />}
-                      {hasRiwaya && <div style={{ width: 4, height: 4, borderRadius: "50%", background: "#a855f7" }} />}
-                    </div>
-                  )}
-                  {m.hizbMark && (
-                    <div style={{ position: "absolute", bottom: 0, left: 0, fontSize: 7, color: "#c9a96e", background: "#c9a96e22", borderRadius: 2, padding: "0 2px", pointerEvents: "none", zIndex: 20 }}>
-                      {m.hizbMark.symbol}
-                    </div>
-                  )}
-                  <div dangerouslySetInnerHTML={{ __html: svgToRender }} style={{ width: "100%", height: "100%" }} />
-                </div>
-              );
-            })}
-          </div>
-        ))}
-
-        {parsed.hizbMarks.length > 0 && (
-          <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 6 }}>
-            {parsed.hizbMarks.map((h, i) => (
-              <div key={i} style={{ background: "#c9a96e22", border: "1px solid #c9a96e44", color: "#c9a96e", borderRadius: 4, padding: "2px 7px", fontSize: 10, fontWeight: 700 }}
-                title={h.positionId}>{h.symbol} {h.label} <span style={{ opacity: 0.6, fontSize: 9 }}>({h.positionId})</span></div>
+    <div style={{ position: "relative" }}>
+      <button style={{ ...SP.btn, ...(open ? SP.btnOn : {}), fontSize: 14 }}
+        title="Arabic character palette" onClick={() => setOpen(!open)}>
+        ﻉ
+      </button>
+      {open && (
+        <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, zIndex: 200, background: "#151820", border: "1px solid #2a2f3e", borderRadius: 8, padding: "10px 12px", width: 320, boxShadow: "0 8px 32px #00000080" }}>
+          {/* Tabs */}
+          <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+            {(Object.keys(ARABIC_CHARS) as (keyof typeof ARABIC_CHARS)[]).map((t) => (
+              <button key={t} style={{ ...SP.smallBtn, ...(tab === t ? SP.btnOn : {}), borderRadius: 4 }}
+                onClick={() => setTab(t)}>{t}</button>
             ))}
-          </div>
-        )}
-      </div>
-
-      {/* Offset edit panel */}
-      {editMode && editTool === "offset" && selectedWordId && selOffset && (
-        <div style={SP.panel}>
-          <div style={SP.panelHd}>
-            <code style={{ color: "#7dd3fc", fontSize: 11 }}>{selectedWordId}</code>
-            <button style={SP.btn} onClick={resetSel}>↺ Reset</button>
-          </div>
-          <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "center" }}>
-              <span style={SP.dim}>Position (↑↓←→)</span>
-              <div style={SP.arrowGrid}>
-                <div /><button style={SP.arrowBtn} onClick={() => onOffsetChange(selectedWordId, { x: 0, y: -step })}>▲</button><div />
-                <button style={SP.arrowBtn} onClick={() => onOffsetChange(selectedWordId, { x: -step, y: 0 })}>◀</button>
-                <button style={{ ...SP.arrowBtn, color: "#4b5563" }} onClick={resetSel}>⊙</button>
-                <button style={SP.arrowBtn} onClick={() => onOffsetChange(selectedWordId, { x: step, y: 0 })}>▶</button>
-                <div /><button style={SP.arrowBtn} onClick={() => onOffsetChange(selectedWordId, { x: 0, y: step })}>▼</button><div />
-              </div>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={SP.dim}>Fine (vb units)</span>
-              {(["x","y"] as const).map((ax) => (
-                <div key={ax} style={{ display: "flex", gap: 5, alignItems: "center" }}>
-                  <label style={{ ...SP.dim, width: 12 }}>{ax.toUpperCase()}</label>
-                  <input type="number" style={SP.numInput} value={selOffset[ax]}
-                    onChange={(e) => { const v = parseFloat(e.target.value) || 0; onOffsetChange(selectedWordId, ax === "x" ? { x: v - selOffset.x, y: 0 } : { x: 0, y: v - selOffset.y }); }} />
-                </div>
-              ))}
-              <span style={{ ...SP.dim, fontSize: 9 }}>CSS: translate({((selOffset.x / 1000)*100).toFixed(3)}%, {((selOffset.y / 2300)*100).toFixed(3)}%)</span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Color edit panel */}
-      {editMode && editTool === "color" && selectedWordId && (
-        <div style={SP.panel}>
-          <div style={SP.panelHd}>
-            <code style={{ color: "#7dd3fc", fontSize: 11 }}>{selectedWordId}</code>
-            {selColor && <button style={SP.btn} onClick={() => onColorChange(selectedWordId, "")}>↺ Clear</button>}
-          </div>
-          <div style={{ fontSize: 11, color: "#9ca3af" }}>
-            SVG fill: {selColor ? <span style={{ background: selColor, color: "#000", borderRadius: 4, padding: "1px 8px" }}>{selColor}</span> : <span style={{ color: "#4b5563" }}>default</span>}
-            <span style={{ color: "#4b5563", marginLeft: 8, fontSize: 10 }}>Preview only — not in TSX</span>
-          </div>
-        </div>
-      )}
-
-      {/* Tafsir/Riwaya panel */}
-      {editMode && (editTool === "tafsir" || editTool === "riwaya") && (
-        <div style={SP.panel}>
-          <div style={SP.panelHd}>
-            <span style={{ color: "#9ca3af", fontSize: 11 }}>{editTool === "tafsir" ? "📖 تفسير" : "📜 رواية"} — اختر هدفاً:</span>
-          </div>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
-            {selectedWordId && (
-              <button style={{ ...SP.btn, ...(annTarget?.type === "word" ? SP.btnOn : {}) }}
-                onClick={() => setAnnTarget({ key: selectedWordId, type: "word", label: annTarget?.label ?? "كلمة" })}>
-                🔤 كلمة
+            {favorites.length > 0 && (
+              <button style={{ ...SP.smallBtn, ...(tab === "حروف" ? {} : {}), borderRadius: 4, marginLeft: "auto", color: "#c9a96e" }}
+                onClick={() => saveFaves([])}>
+                ↺ فضلات
               </button>
             )}
-            {parsed.segments.flatMap((seg) => seg.ayahs).slice(0, 20).map((a) => {
-              const key = `ayah_${a.surahNumber}_${a.aid}`;
-              return <button key={key} style={{ ...SP.btn, ...(annTarget?.key === key ? SP.btnOn : {}) }}
-                onClick={() => setAnnTarget({ key, type: "ayah", label: `${a.surahNumber}:${a.ayahNum}` })}>
-                {a.surahNumber}:{a.ayahNum}
-              </button>;
-            })}
-            {parsed.segments.map((seg) => {
-              const key = `surah_${seg.surahNumber}`;
-              return <button key={key} style={{ ...SP.btn, ...(annTarget?.key === key ? SP.btnOn : {}) }}
-                onClick={() => setAnnTarget({ key, type: "surah", label: `سورة ${seg.surahNumber}` })}>
-                سورة {seg.surahNumber}
-              </button>;
-            })}
           </div>
-          {annTarget && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ fontSize: 11, color: "#c9a96e" }}>→ {annTarget.label} ({annTarget.type})</div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <input style={{ ...SP.numInput, flex: 1 }} value={annTitle} onChange={(e) => setAnnTitle(e.target.value)} placeholder={editTool === "tafsir" ? "ابن كثير..." : "ورش عن نافع..."} />
-                <input style={{ ...SP.numInput, flex: 1 }} value={annSource} onChange={(e) => setAnnSource(e.target.value)} placeholder="المرجع..." />
+          {/* Grid */}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, direction: "rtl" }}>
+            {chars.map((ch, i) => ch.trim() ? <CharBtn key={i} ch={ch.trim()} /> : null)}
+          </div>
+          {/* Shortcuts list */}
+          {Object.keys(shortcuts).length > 0 && (
+            <div style={{ marginTop: 8, borderTop: "1px solid #1e2332", paddingTop: 6 }}>
+              <div style={{ fontSize: 9, color: "#6b7280", marginBottom: 4 }}>اختصارات</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {Object.entries(shortcuts).map(([k, v]) => (
+                  <span key={k} style={{ fontSize: 11, background: "#1e2332", border: "1px solid #2a2f3e", borderRadius: 4, padding: "2px 6px", color: "#c9a96e", cursor: "pointer", fontFamily: "AALMAGHRIBI, serif" }}
+                    onClick={() => handleInsert(v)}
+                    title={`${k} → ${v} (click to insert, right-click to delete)`}
+                    onContextMenu={(e) => { e.preventDefault(); const s = { ...shortcuts }; delete s[k]; saveScs(s); }}>
+                    {k}→{v}
+                  </span>
+                ))}
               </div>
-              <textarea style={{ ...SP.numInput, height: 70, resize: "vertical", direction: "rtl" }}
-                value={annBody} onChange={(e) => setAnnBody(e.target.value)} placeholder="النص هنا..." />
-              <div style={{ display: "flex", gap: 6 }}>
-                <button style={{ ...SP.btn, ...SP.btnGold }}
-                  onClick={() => {
-                    if (!annBody.trim()) return;
-                    onAnnotationSave({ id: `ann_${annTarget.key}_${editTool}_${Date.now()}`, type: editTool as "tafsir"|"riwaya", targetType: annTarget.type, targetKey: annTarget.key, title: annTitle, body: annBody, source: annSource });
-                    setAnnTitle(""); setAnnBody(""); setAnnSource("");
-                  }}>💾 حفظ</button>
-                <button style={SP.btn} onClick={() => { setAnnTitle(""); setAnnBody(""); setAnnSource(""); }}>✕</button>
-              </div>
-              {(() => {
-                const ex = Object.values(annotations).filter((a) => a.targetKey === annTarget.key && a.type === editTool);
-                return ex.length > 0 ? (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {ex.map((a) => (
-                      <div key={a.id} style={{ background: "#0a0c10", border: "1px solid #1e2332", borderRadius: 6, padding: "6px 10px" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                          <span style={{ fontSize: 11, color: "#c9a96e" }}>{a.title}</span>
-                          <button style={{ ...SP.btn, color: "#f87171", fontSize: 10 }} onClick={() => onAnnotationDelete(a.id)}>🗑️</button>
-                        </div>
-                        <div style={{ fontSize: 12, color: "#e8e6e0", direction: "rtl", lineHeight: 1.6 }}>{a.body}</div>
-                      </div>
-                    ))}
-                  </div>
-                ) : null;
-              })()}
             </div>
           )}
+          <div style={{ fontSize: 9, color: "#4b5563", marginTop: 6, direction: "rtl" }}>
+            نقر = نسخ للحافظة · ★ = مفضلة · ⌨ = اختصار · انقر يميناً على الاختصار لحذفه
+          </div>
         </div>
       )}
-
-      {hasOffsets && <pre style={SP.cssPre}>{cssText}</pre>}
     </div>
   );
 }
@@ -2067,8 +2123,7 @@ function BatchImportView({
   onImportDone: (entries: HistoryEntry[], newHizbCursor: number) => void;
   hizbCursor: number;
   onHizbCursorUpdate: (v: number) => void;
-  floatPrecision: number;
-  multipass: boolean;
+
 }) {
   const [items, setItems]         = useState<ImportItem[]>([]);
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -2245,8 +2300,7 @@ function BatchImportView({
       updateItem(it.id, { status: "processing" });
       try {
         const { entry, hizbCursorOut } = await processOnePage(
-          it.html, it.pageNumber, surahNums, cursor, floatPrecision, multipass,
-          (done, total) => setProgress({ current: i, total: ready.length, svgDone: done, svgTotal: total }),
+          it.html, it.pageNumber, surahNums, cursor,
         );
         cursor = hizbCursorOut;
 
@@ -2262,7 +2316,7 @@ function BatchImportView({
           }
         }
 
-        entries.push({ ...entry, searchOverrides: {}, copyOverrides: copyOvr, pageAlign: "justify", wordGap: 2 });
+        entries.push({ ...entry, searchOverrides: {}, copyOverrides: copyOvr, pageAlign: "justify", wordGap: 0, wordMargin: 0 });
         updateItem(it.id, { status: "done" });
       } catch (e: any) {
         updateItem(it.id, { status: "error", error: e.message });
@@ -2696,31 +2750,232 @@ function HafsWarshMapping({ history }: { history: HistoryEntry[] }) {
   );
 }
 
+
+const SURAH_AYAH_COUNTS: Record<number, number> = {
+  1: 7, 2: 286, 3: 200, 4: 176, 5: 120, 6: 165, 7: 206, 8: 75, 9: 129, 10: 109,
+  11: 123, 12: 111, 13: 43, 14: 52, 15: 99, 16: 128, 17: 111, 18: 110, 19: 98, 20: 135,
+  21: 112, 22: 78, 23: 118, 24: 64, 25: 77, 26: 227, 27: 93, 28: 88, 29: 69, 30: 60,
+  31: 34, 32: 30, 33: 73, 34: 54, 35: 45, 36: 83, 37: 182, 38: 88, 39: 75, 40: 85,
+  41: 54, 42: 53, 43: 89, 44: 59, 45: 37, 46: 35, 47: 38, 48: 29, 49: 18, 50: 45,
+  51: 60, 52: 49, 53: 62, 54: 55, 55: 78, 56: 96, 57: 29, 58: 22, 59: 24, 60: 13,
+  61: 14, 62: 11, 63: 11, 64: 18, 65: 12, 66: 12, 67: 30, 68: 52, 69: 52, 70: 44,
+  71: 28, 72: 28, 73: 20, 74: 56, 75: 40, 76: 31, 77: 50, 78: 40, 79: 46, 80: 42,
+  81: 29, 82: 19, 83: 36, 84: 25, 85: 22, 86: 17, 87: 19, 88: 26, 89: 30, 90: 20,
+  91: 15, 92: 21, 93: 11, 94: 8, 95: 8, 96: 19, 97: 5, 98: 8, 99: 8, 100: 11,
+  101: 11, 102: 8, 103: 3, 104: 9, 105: 5, 106: 4, 107: 7, 108: 3, 109: 6, 110: 3,
+  111: 5, 112: 4, 113: 5, 114: 6,
+};
+
+
+function HafsWarshMappingPanel({ history, hafsWarshMap, onMapChange }: {
+  history: HistoryEntry[]; hafsWarshMap: HafsWarshMap; onMapChange: (map: HafsWarshMap) => void;
+}) {
+  const [jsonText, setJsonText] = useState(() => JSON.stringify(hafsWarshMap, null, 2));
+  const [jsonError, setJsonError] = useState<string | null>(null);
+  const [jsonDirty, setJsonDirty] = useState(false);
+  const [fetchingTafsir, setFetchingTafsir] = useState(false);
+  const [offlineTafsir, setOfflineTafsir] = useState<Record<string, string>>({});
+  const [tafsirSrc, setTafsirSrc] = useState("ibn_kathir");
+  const [fetchProg, setFetchProg] = useState({ done: 0, total: 0 });
+  const [fetchErr, setFetchErr] = useState<string | null>(null);
+
+  const allSurahs = [...new Set(history.flatMap(e => e.surahNumbers))].sort((a, b) => a - b);
+
+  useEffect(() => { if (!jsonDirty) setJsonText(JSON.stringify(hafsWarshMap, null, 2)); }, [hafsWarshMap]);
+
+  const applyJson = () => {
+    try {
+      const parsed = JSON.parse(jsonText);
+      const normalized: HafsWarshMap = {};
+      for (const [sk, sv] of Object.entries(parsed)) {
+        if (isNaN(parseInt(sk))) throw new Error(`مفتاح سورة غير صحيح: "${sk}"`);
+        normalized[sk] = {};
+        for (const [hk, wl] of Object.entries(sv as Record<string, unknown>)) {
+          if (!Array.isArray(wl)) throw new Error(`يجب مصفوفة: ${sk}:${hk}`);
+          normalized[sk][hk] = (wl as (string | number)[]).map(String);
+        }
+      }
+      onMapChange(normalized);
+      setJsonText(JSON.stringify(normalized, null, 2));
+      setJsonError(null); setJsonDirty(false);
+    } catch (e: any) { setJsonError(e.message); }
+  };
+
+  const addSurahMapping = (surahNum: number, ayahCount: number) => {
+    const surahEntry: Record<string, string[]> = {};
+    for (let i = 1; i <= ayahCount; i++) surahEntry[String(i)] = [String(i)];
+    const next = { ...hafsWarshMap, [String(surahNum)]: surahEntry };
+    onMapChange(next); setJsonText(JSON.stringify(next, null, 2)); setJsonDirty(false);
+  };
+
+  const fetchAllOfflineTafsir = async () => {
+    setFetchingTafsir(true); setFetchErr(null);
+    const result: Record<string, string> = { ...offlineTafsir };
+    const tafsirId = TAFSIR_SOURCES[tafsirSrc]?.id ?? 4;
+    const toFetch: Array<{ surah: number; warshAyah: number; hafsAyah: number }> = [];
+    for (const entry of history) {
+      for (const seg of entry.parsed.segments) {
+        for (const a of seg.ayahs) {
+          if (a.ayahNum <= 0) continue;
+          const warshKey = `${seg.surahNumber}:${a.ayahNum}`;
+          if (!result[warshKey]) {
+            const hafsAyah = warshToHafs(hafsWarshMap, seg.surahNumber, a.ayahNum);
+            toFetch.push({ surah: seg.surahNumber, warshAyah: a.ayahNum, hafsAyah });
+          }
+        }
+      }
+    }
+    const unique = toFetch.filter((item, i, arr) =>
+      arr.findIndex(x => x.surah === item.surah && x.warshAyah === item.warshAyah) === i);
+    setFetchProg({ done: 0, total: unique.length });
+    const bySurah: Record<number, { warsh: number; hafs: number }[]> = {};
+    for (const item of unique) {
+      if (!bySurah[item.surah]) bySurah[item.surah] = [];
+      bySurah[item.surah].push({ warsh: item.warshAyah, hafs: item.hafsAyah });
+    }
+    let done = 0;
+    for (const [surahStr, pairs] of Object.entries(bySurah)) {
+      const surah = parseInt(surahStr);
+      const sorted = [...pairs].sort((a, b) => a.hafs - b.hafs);
+      try {
+        const fetched = await fetchTafsirRange(surah, tafsirId, sorted[0].hafs, sorted[sorted.length - 1].hafs);
+        for (const pair of sorted) {
+          const text = fetched[pair.hafs];
+          if (text) result[`${surah}:${pair.warsh}`] = text;
+          done++;
+        }
+        setFetchProg({ done, total: unique.length });
+        await new Promise<void>(r => setTimeout(r, 100));
+      } catch (e: any) { setFetchErr(`Surah ${surah}: ${e.message}`); }
+    }
+    setOfflineTafsir(result); setFetchingTafsir(false);
+  };
+
+  const exportOfflineTafsir = () => {
+    const blob = new Blob([JSON.stringify({
+      _version: 1, _date: new Date().toISOString(),
+      tafsirSource: tafsirSrc, hafsWarshMap, tafsirs: offlineTafsir,
+    }, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `tafsir-offline-${tafsirSrc}-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
+          🗺️ Hafs ↔ Warsh Mapping
+        </div>
+        <div style={{ fontSize: 11, color: "#9ca3af", direction: "rtl", lineHeight: 2 }}>
+          <b>التنسيق:</b> <code style={S.ic}>{"{ surah: { hafsAyah: [warshAyah,...] } }"}</code><br />
+          مثال: آية حفص 13 = آيتي ورش 13 و14 ←{" "}
+          <code style={S.ic}>{"{ "2": { "13": ["13","14"] } }"}</code><br />
+          تركها فارغة أو <code style={S.ic}>{"{}"}</code> = نفس الترقيم بين الروايتين.
+        </div>
+      </div>
+
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase" }}>📝 JSON Editor</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {jsonDirty && <span style={{ fontSize: 9, color: "#f59e0b", alignSelf: "center" }}>⚠️ unsaved</span>}
+            <button style={{ ...S.exportBtn, fontSize: 10 }} onClick={applyJson}>✅ Apply</button>
+            <button style={{ ...S.actBtn, fontSize: 10 }} onClick={() => { setJsonText("{}"); setJsonDirty(true); }}>↺ Clear</button>
+          </div>
+        </div>
+        <textarea
+          style={{ ...S.textarea, height: 220, direction: "ltr", fontFamily: "monospace", fontSize: 12 }}
+          value={jsonText}
+          onChange={(e) => { setJsonText(e.target.value); setJsonDirty(true); }}
+          spellCheck={false}
+        />
+        {jsonError && <div style={{ fontSize: 10, color: "#f87171", marginTop: 4 }}>❌ {jsonError}</div>}
+      </div>
+
+      {allSurahs.length > 0 && (
+        <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px" }}>
+          <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
+            ⚡ Quick-add 1:1 mapping
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {allSurahs.map((sn) => {
+              const hasMapping = !!hafsWarshMap[String(sn)];
+              return (
+                <button key={sn}
+                  style={{ ...S.miniBtn, background: hasMapping ? "#10b98120" : "#1e2332", border: `1px solid ${hasMapping ? "#10b98144" : "#2a2f3e"}`, color: hasMapping ? "#10b981" : "#9ca3af" }}
+                  onClick={() => addSurahMapping(sn, SURAH_AYAH_COUNTS[sn] ?? 0)}
+                  title={`سورة ${sn} — ${SURAH_AYAH_COUNTS[sn] ?? "?"} آية`}>
+                  {sn}{hasMapping ? " ✓" : " +"}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 9, color: "#4b5563", marginTop: 6, direction: "rtl" }}>
+            الزر يضيف تعيين 1:1 (آية حفص N = آية ورش N) — عدّله يدوياً في المحرر للحالات الخاصة.
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase" }}>📖 Offline Tafsir Export</div>
+        <div style={{ fontSize: 10, color: "#6b7280", direction: "rtl", lineHeight: 1.7 }}>
+          جلب التفسير لكل الآيات المعالجة باستخدام الخريطة أعلاه (ورش→حفص)، ثم تصديره كـ JSON للعمل أوفلاين.
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <select style={{ ...S.input, width: "auto" }} value={tafsirSrc} onChange={(e) => setTafsirSrc(e.target.value)}>
+            {Object.entries(TAFSIR_SOURCES).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+          </select>
+          <button style={S.exportBtn} onClick={fetchAllOfflineTafsir}
+            disabled={fetchingTafsir || history.length === 0}>
+            {fetchingTafsir ? `⏳ ${fetchProg.done}/${fetchProg.total}...` : "⬇️ Fetch All"}
+          </button>
+          {Object.keys(offlineTafsir).length > 0 && (
+            <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#10b981,#059669)" }}
+              onClick={exportOfflineTafsir}>
+              💾 Export ({Object.keys(offlineTafsir).length} آية)
+            </button>
+          )}
+        </div>
+        {fetchingTafsir && (
+          <div style={S.pTrack}>
+            <div style={{ ...S.pFill, width: `${fetchProg.total ? (fetchProg.done/fetchProg.total)*100 : 0}%` }} />
+          </div>
+        )}
+        {fetchErr && <div style={{ fontSize: 10, color: "#f87171" }}>⚠️ {fetchErr}</div>}
+        {Object.keys(offlineTafsir).length > 0 && (
+          <div style={{ fontSize: 10, color: "#4ade80" }}>
+            ✅ {Object.keys(offlineTafsir).length} آية جاهزة
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function QuranProcessor() {
   // ── State (IndexedDB for pages, localStorage for settings)
   const [ready,        setReady]        = useState(false);
   const [history,      setHistory]      = useState<HistoryEntry[]>([]);
-  const [allOffsets,   setAllOffsets]   = useState<Record<string, OffsetMap>>({});
   const [allColors,    setAllColors]    = useState<Record<string, ColorMap>>({});
   const [annotations,  setAnnotations]  = useState<AnnotationStore>({});
   const [lineGap,      setLineGap]      = useState(4);
   const [hizbCursor,   setHizbCursor]   = useState(0);
-  const [svgoFP,       setSvgoFP]       = useState(3);
-  const [svgoMP,       setSvgoMP]       = useState(true);
+
   const [backupError,  setBackupError]  = useState<string | null>(null);
   const [backupProg,   setBackupProg]   = useState<{done:number;total:number}|null>(null);
   const backupFileRef = useRef<HTMLInputElement>(null);
 
   // Helper: get current Settings object
   const currentSettings = (): Settings => ({
-    allOffsets, allColors, annotations, lineGap, hizbCursor,
-    lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP,
+    allColors, annotations, lineGap, hizbCursor,
+    lastPageNumber: pageNumber,
   });
 
   // Load once on mount — IndexedDB for pages, localStorage for settings
   useEffect(() => {
     const s = loadSettings();
-    setAllOffsets(s.allOffsets);
     setAllColors(s.allColors);
     setAnnotations(s.annotations);
     setLineGap(s.lineGap);
@@ -2739,8 +2994,8 @@ export default function QuranProcessor() {
   // Save settings on every change (lightweight — no SVG data)
   useEffect(() => {
     if (!ready) return;
-    saveSettings({ allOffsets, allColors, annotations, lineGap, hizbCursor,
-      lastPageNumber: pageNumber, svgoFloatPrec: svgoFP, svgoMultipass: svgoMP });
+    saveSettings({ allColors, annotations, lineGap, hizbCursor,
+      lastPageNumber: pageNumber });
   });
 
   // ── Single-page processor state
@@ -2748,7 +3003,6 @@ export default function QuranProcessor() {
   const [pageNumber, setPageNumber] = useState(1);
   const [surahInput, setSurahInput] = useState("1");
   const [step,       setStep]       = useState<Step>("idle");
-  const [compProg,   setCompProg]   = useState({ done: 0, total: 0 });
   const [error,      setError]      = useState<string | null>(null);
   const [isDragging, setDrag]       = useState(false);
   const fileRef2 = useRef<HTMLInputElement>(null);
@@ -2760,7 +3014,6 @@ export default function QuranProcessor() {
   const [selectedWordId, setSelectedWordId] = useState<string | null>(null);
   const [copied,         setCopied]         = useState(false);
 
-  const currentOffsets: OffsetMap             = activeEntry ? (allOffsets[activeEntry.id] ?? {})    : {};
   const currentColors:  ColorMap              = activeEntry ? (allColors[activeEntry.id]  ?? {})    : {};
   const currentAnns:    Record<string,Annotation> = activeEntry ? (annotations[activeEntry.id] ?? {}) : {};
 
@@ -2804,6 +3057,14 @@ export default function QuranProcessor() {
   const handleWordGapChange = useCallback((gap: number) => {
     if (!activeEntry) return;
     const updated = { ...activeEntry, wordGap: gap };
+    setActiveEntry(updated);
+    idbPut(updated).catch(console.error);
+    setHistory((prev) => prev.map((e) => e.id === activeEntry.id ? updated : e));
+  }, [activeEntry]);
+
+  const handleWordMarginChange = useCallback((margin: number) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, wordMargin: margin };
     setActiveEntry(updated);
     idbPut(updated).catch(console.error);
     setHistory((prev) => prev.map((e) => e.id === activeEntry.id ? updated : e));
@@ -2857,11 +3118,10 @@ export default function QuranProcessor() {
     try {
       setStep("parsing"); await tick();
       const { entry, hizbCursorOut } = await processOnePage(
-        html, pageNumber, surahNumbers, hizbCursor, svgoFP, svgoMP,
-        (done, total) => { setStep("compressing"); setCompProg({ done, total }); },
+        html, pageNumber, surahNumbers, hizbCursor,
       );
       setHizbCursor(hizbCursorOut);
-      const full: HistoryEntry = { ...entry, searchOverrides: {}, copyOverrides: {}, pageAlign: "justify", wordGap: 2 };
+      const full: HistoryEntry = { ...entry, searchOverrides: {}, copyOverrides: {}, pageAlign: "justify", wordGap: 0, wordMargin: 0 };
       idbPut(full).catch(console.error);
       setHistory((prev) => { const i = prev.findIndex((e) => e.pageNumber === pageNumber); if (i !== -1) { const n = [...prev]; n[i] = full; return n; } return [...prev, full]; });
       setActiveEntry(full);
@@ -2870,7 +3130,7 @@ export default function QuranProcessor() {
       setPageNumber((p) => p + 1);
       setHtml("");
     } catch (e: any) { setError(e.message ?? "Error"); setStep("error"); }
-  }, [html, pageNumber, surahNumbers, hizbCursor, svgoFP, svgoMP]);
+  }, [html, pageNumber, surahNumbers, hizbCursor]);
 
   const handleBatchDone = (entries: HistoryEntry[], newCursor: number) => {
     setHizbCursor(newCursor);
@@ -2897,7 +3157,7 @@ export default function QuranProcessor() {
   };
   const exportManager = () => {
     if (history.length === 0) return;
-    dl(generateMushafManager(history, allOffsets, lineGap), "MushafManager.tsx");
+    dl(generateMushafManager(history), "MushafManager.tsx");
   };
   const removeEntry = (id: string) => { idbDelete(id).catch(console.error); setHistory((prev) => prev.filter((e) => e.id !== id)); if (activeEntry?.id === id) setActiveEntry(null); };
   const renameEntry = (id: string, label: string) => {
@@ -2918,10 +3178,9 @@ export default function QuranProcessor() {
     localStorage.removeItem(STORAGE_KEY); // legacy cleanup
   };
 
-  const isRunning  = step !== "idle" && step !== "done" && step !== "error";
+  const isRunning  = step === "parsing";
   const canProcess = !!html.trim() && surahNumbers.length > 0 && !isRunning;
   const totalWords = activeEntry?.parsed.lines.reduce((s, l) => s + l.words.length, 0) ?? 0;
-  const savings    = activeEntry ? Math.round((1 - activeEntry.parsed.compressedBytes / activeEntry.parsed.originalBytes) * 100) : 0;
   const hizbPct    = Math.min((hizbCursor / 60) * 100, 100);
 
   if (!ready) return <div style={{ minHeight: "100vh", background: "#0f1117", display: "flex", alignItems: "center", justifyContent: "center", color: "#c9a96e", fontSize: 18 }}>﷽ Loading...</div>;
@@ -2968,17 +3227,6 @@ export default function QuranProcessor() {
                 <input style={S.input} value={surahInput} onChange={(e) => setSurahInput(e.target.value)} placeholder="1  or  2,3  or  18" />
                 {surahNumbers.length > 1 && <div style={{ fontSize: 10, color: "#c9a96e", marginTop: 2 }}>Multi: {surahNumbers.join(" + ")}</div>}
               </Field>
-            </section>
-
-            <section style={S.card}>
-              <div style={S.cardTitle}>🗜️ SVGO</div>
-              <Field label={`Float Precision: ${svgoFP}`}>
-                <input style={{ ...S.input, padding: "3px 0", cursor: "pointer" }} type="range" min={0} max={8} step={1} value={svgoFP} onChange={(e) => setSvgoFP(parseInt(e.target.value))} />
-              </Field>
-              <div style={S.row}>
-                <span style={S.label}>Multipass</span>
-                <button style={{ ...S.toggle, ...(svgoMP ? S.toggleOn : {}) }} onClick={() => setSvgoMP(!svgoMP)}>{svgoMP ? "ON" : "OFF"}</button>
-              </div>
             </section>
 
             <section style={S.card}>
@@ -3057,7 +3305,6 @@ export default function QuranProcessor() {
                       // Restore state
                       const uniquePages = allPages.filter((p, i, arr) => arr.findIndex(x => x.id === p.id) === i);
                       setHistory(uniquePages.sort((a, b) => a.pageNumber - b.pageNumber));
-                      setAllOffsets(mergedSettings.allOffsets);
                       setAllColors(mergedSettings.allColors);
                       setAnnotations(mergedSettings.annotations);
                       setLineGap(mergedSettings.lineGap);
@@ -3077,6 +3324,15 @@ export default function QuranProcessor() {
                 <div style={{ fontSize: 9, color: "#4b5563", lineHeight: 1.5 }}>
                   يحفظ: {history.length} صفحة، الإزاحات، الألوان، التفسيرات، الإعدادات
                 </div>
+                <button style={{ ...S.toggle, width: "100%", fontSize: 10, color: "#a78bfa" }}
+                  onClick={async () => {
+                    try {
+                      const cov = Object.fromEntries(history.map(e => [e.id, e.copyOverrides ?? {}]));
+                      await exportDocx(history, cov);
+                    } catch (e: any) { alert("DOCX: " + e.message); }
+                  }}>
+                  📝 Export DOCX
+                </button>
               </div>
             </section>
 
@@ -3097,12 +3353,7 @@ export default function QuranProcessor() {
               <textarea style={S.textarea} placeholder={"Paste Quran page HTML here..."} value={html} onChange={(e) => setHtml(e.target.value)} spellCheck={false} />
               {looksEscaped && <div style={S.infoBanner}>🔄 Escaped chars detected — auto-unescape on process.</div>}
               {error && <div style={S.errBanner}>❌ {error}</div>}
-              {isRunning && (
-                <div style={{ marginTop: 8 }}>
-                  <div style={S.progressLabel}>{step === "compressing" ? `🗜️ SVGs: ${compProg.done}/${compProg.total}` : "⚙️ Parsing..."}</div>
-                  {step === "compressing" && <div style={S.pTrack}><div style={{ ...S.pFill, width: `${compProg.total ? (compProg.done / compProg.total) * 100 : 0}%` }} /></div>}
-                </div>
-              )}
+              {isRunning && <div style={S.progressLabel}>⚙️ Parsing...</div>}
               <button style={{ ...S.btn, ...(!canProcess ? S.btnOff : {}) }} onClick={process} disabled={!canProcess}>
                 {isRunning ? "Processing..." : "⚡ Process"}
               </button>
@@ -3111,17 +3362,11 @@ export default function QuranProcessor() {
             {activeEntry && (
               <section style={S.card}>
                 <div style={S.stats}>
-                  {([["Lines", activeEntry.parsed.lines.length], ["Words", totalWords], ["SVGs", totalWords], ["Ayahs", activeEntry.parsed.segments.reduce((s, sg) => s + sg.ayahs.length, 0)], ["Hizb✓", activeEntry.parsed.hizbMarks.length]] as [string,number][]).map(([l, v]) => (
+                  {([["Lines", activeEntry.parsed.lines.length], ["Words", totalWords], ["Ayahs", activeEntry.parsed.segments.reduce((s, sg) => s + sg.ayahs.length, 0)], ["Hizb✓", activeEntry.parsed.hizbMarks.length]] as [string,number][]).map(([l, v]) => (
                     <div key={l} style={S.stat}><span style={S.statN}>{v}</span><span style={S.statL}>{l}</span></div>
                   ))}
                 </div>
-                <div style={S.compressionBar}>
-                  <span style={{ color: "#6b7280" }}>SVG: </span>
-                  <span style={{ color: "#f87171" }}>{kb(activeEntry.parsed.originalBytes)} KB</span>
-                  <span style={{ color: "#6b7280" }}> → </span>
-                  <span style={{ color: "#4ade80" }}>{kb(activeEntry.parsed.compressedBytes)} KB</span>
-                  <span style={{ color: "#c9a96e", marginLeft: 8, fontWeight: 700 }}>↓ {savings}%</span>
-                </div>
+
                 <div style={S.tabs}>
                   {(["tsx","summary","preview","apis"] as const).map((t) => (
                     <button key={t} style={{ ...S.tab, ...(outputTab === t ? S.tabOn : {}) }} onClick={() => setOutputTab(t)}>
@@ -3165,16 +3410,29 @@ export default function QuranProcessor() {
                     ))}
                   </div>
                 )}
-                {outputTab === "preview" && (
+                {outputTab === "preview" && activeEntry && (
+                  <WordEditor
+                    entry={activeEntry}
+                    wordEdits={activeEntry.wordEdits ?? {}}
+                    onWordEdit={handleWordEdit}
+                    pageAlign={activeEntry.pageAlign ?? "justify"}
+                    wordGap={activeEntry.wordGap ?? 55}
+                    fontSize={activeEntry.fontSize ?? 32}
+                    lineGap={activeEntry.lineGap ?? 8}
+                    onPageAlignChange={handlePageAlignChange}
+                    onWordGapChange={handleWordGapChange}
+                    onFontSizeChange={handleFontSizeChange}
+                    onLineGapChange={handleLineGapChange}
+                    onApplyToAll={handleApplyToAll}
+                  />
+                )}
+                {false && outputTab === "preview_old" && (
                   <SvgChainPreviewer
                     parsed={activeEntry.parsed} selectedWordId={selectedWordId} onSelectWord={setSelectedWordId}
                     offsets={currentOffsets} onOffsetChange={handleOffsetChange}
                     colors={currentColors} onColorChange={handleColorChange}
                     annotations={currentAnns} onAnnotationSave={handleAnnSave} onAnnotationDelete={handleAnnDelete}
-                    lineGap={lineGap} onLineGapChange={setLineGap}
-                    pageAlign={activeEntry.pageAlign ?? "justify"} onPageAlignChange={handlePageAlignChange}
-                    wordGap={activeEntry.wordGap ?? 2} onWordGapChange={handleWordGapChange}
-                    onApplyGapToAll={handleApplyGapToAll} onApplyWordGapToAll={handleApplyWordGapToAll}
+
                   />
                 )}
                 {outputTab === "apis" && (
@@ -3200,8 +3458,7 @@ export default function QuranProcessor() {
               onImportDone={handleBatchDone}
               hizbCursor={hizbCursor}
               onHizbCursorUpdate={setHizbCursor}
-              floatPrecision={svgoFP}
-              multipass={svgoMP}
+
             />
           </section>
         </main>
@@ -3239,7 +3496,8 @@ export default function QuranProcessor() {
                 annotations={currentAnns} onAnnotationSave={handleAnnSave} onAnnotationDelete={handleAnnDelete}
                 lineGap={lineGap} onLineGapChange={setLineGap}
                 pageAlign={activeEntry.pageAlign ?? "justify"} onPageAlignChange={handlePageAlignChange}
-                wordGap={activeEntry.wordGap ?? 2} onWordGapChange={handleWordGapChange}
+                wordGap={activeEntry.wordGap ?? 0} onWordGapChange={handleWordGapChange}
+                wordMargin={activeEntry.wordMargin ?? 0} onWordMarginChange={handleWordMarginChange}
                 onApplyGapToAll={handleApplyGapToAll} onApplyWordGapToAll={handleApplyWordGapToAll}
               />
             )}
@@ -3251,7 +3509,7 @@ export default function QuranProcessor() {
       {view === "mapping" && (
         <main style={{ ...S.main, display: "block", maxWidth: 1000 }}>
           <section style={S.card}>
-            <HafsWarshMapping history={history} />
+            <HafsWarshMappingPanel history={history} hafsWarshMap={hafsWarshMap} onMapChange={(m) => { setHafsWarshMap(m); saveSettings({ ...currentSettings(), hafsWarshMap: m }); }} />
           </section>
         </main>
       )}
@@ -3263,25 +3521,27 @@ export default function QuranProcessor() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
               <div style={S.cardTitle}>📋 Manager</div>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {/* NEW: Apply Auto Layout */}
-                <button style={S.exportBtn} onClick={() => {
-                  const updated = applyAutoLayout(history);
-                  setHistory(updated);
-                  idbPutMany(updated).catch(console.error);
-                  // If active entry is affected, refresh it
-                  if (activeEntry) {
-                    const refreshed = updated.find(e => e.id === activeEntry.id);
-                    if (refreshed) setActiveEntry(refreshed);
-                  }
-                }}>📐 Apply Auto Layout (P1-2 & Rest)</button>
 
-                {Object.values(allOffsets).some((om) => Object.values(om).some((o) => o.x !== 0 || o.y !== 0)) && (
-                  <button style={S.exportBtn} onClick={() => {
-                    const all = history.map((e) => { const { lineGroups } = buildWordMetas(e.parsed, 60); return generateOffsetCss(allOffsets[e.id] ?? {}, e.pageNumber, e.surahNumbers, lineGroups, lineGap); }).join("\n\n");
-                    dl(all, "mushaf_offsets.css");
-                  }}>💾 All CSS</button>
-                )}
                 <button style={S.exportBtn} onClick={exportManager} disabled={history.length === 0}>📦 MushafManager.tsx</button>
+                <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#7c3aed,#5b21b6)" }}
+                  disabled={history.length === 0}
+                  onClick={async () => {
+                    try {
+                      setBackupProg({ done: 0, total: history.length });
+                      await exportDocx(history, Object.fromEntries(history.map(e => [e.id, e.copyOverrides ?? {}])), (done, total) => setBackupProg({ done, total }));
+                    } catch (e: any) { alert("DOCX export failed: " + e.message); }
+                    setBackupProg(null);
+                  }}>
+                  {backupProg ? `⏳ ${backupProg.done}/${backupProg.total}...` : "📝 Export DOCX"}
+                </button>
+                <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#0891b2,#0e7490)" }}
+                  disabled={history.length === 0}
+                  onClick={() => {
+                    const tsx = generateAllInOneTsx(history, annotations);
+                    dl(tsx, `mushaf-all-pages-${new Date().toISOString().slice(0,10)}.tsx`);
+                  }}>
+                  📄 All-in-One TSX
+                </button>
                 <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#3b82f6,#1d4ed8)" }}
                   disabled={history.length === 0}
                   onClick={async () => {
@@ -3297,13 +3557,11 @@ export default function QuranProcessor() {
                       }
                       const allCssParts: string[] = [];
                       for (const e of sorted) {
-                        const { lineGroups } = buildWordMetas(e.parsed, 60);
-                        const css = generateOffsetCss(allOffsets[e.id] ?? {}, e.pageNumber, e.surahNumbers, lineGroups, lineGap);
                         cssDir.file(`page${e.pageNumber}_offsets.css`, css);
                         allCssParts.push(css);
                       }
                       cssDir.file("mushaf_offsets.css", allCssParts.join("\n\n"));
-                      zip.file("MushafManager.tsx", generateMushafManager(history, allOffsets, lineGap));
+                      zip.file("MushafManager.tsx", generateMushafManager(history));
                       // backup.json: settings only (pages are in individual TSX files)
                       zip.file("backup.json", JSON.stringify({ _version: BACKUP_VERSION, _date: new Date().toISOString(), settings: currentSettings(), pageIds: sorted.map(e => e.id) }, null, 2));
                       zip.file("README.txt",
@@ -3332,17 +3590,11 @@ export default function QuranProcessor() {
                 </button>
               </div>
             </div>
-            
-              
             {history.length === 0 ? <div style={{ color: "#4b5563", textAlign: "center", padding: "30px 0" }}>No pages yet.</div> : (
               <>
                 <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
                   {[...history].sort((a, b) => a.pageNumber - b.pageNumber).map((e) => {
-                    const po = allOffsets[e.id] ?? {};
-                    const oc = Object.values(po).filter((o) => o.x !== 0 || o.y !== 0).length;
                     const ac = Object.values(annotations[e.id] ?? {}).length;
-                    const { lineGroups } = buildWordMetas(e.parsed, 60);
-                    const css = generateOffsetCss(po, e.pageNumber, e.surahNumbers, lineGroups, lineGap);
                     return (
                       <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 10, background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "8px 12px" }}>
                         <div style={{ ...S.historyPageBadge, fontSize: 13, minWidth: 34 }}>P{e.pageNumber}</div>
@@ -3352,7 +3604,7 @@ export default function QuranProcessor() {
                             <span>Surah {e.surahNumbers.join(",")}</span>
                             <span>{e.parsed.lines.length}L</span>
                             <span>{kb(e.parsed.compressedBytes)}KB</span>
-                            {oc > 0 && <span style={{ color: "#c9a96e" }}>{oc} offsets</span>}
+
                             {ac > 0 && <span style={{ color: "#10b981" }}>{ac} ann.</span>}
                             {e.parsed.hasSajda && <span style={{ color: "#4ade80" }}>◆سجدة</span>}
                             {e.parsed.hizbMarks.map((h, i) => <span key={i} style={{ color: "#c9a96e" }}>{h.symbol}{h.positionId.split("_")[3] ?? ""}</span>)}
@@ -3360,14 +3612,14 @@ export default function QuranProcessor() {
                         </div>
                         <div style={{ display: "flex", gap: 5 }}>
                           <button style={S.actBtn} onClick={() => { setActiveEntry(e); setView("previewer"); }}>🔍</button>
-                          {oc > 0 && <button style={{ ...S.actBtn, color: "#c9a96e" }} onClick={() => dl(css, `page${e.pageNumber}_offsets.css`)}>CSS</button>}
+
                           <button style={S.actBtn} onClick={() => dl(generateTsx(e.parsed, e.searchOverrides, e.copyOverrides ?? {}, annotations[e.id] ?? {}, lineGap, e.pageAlign ?? "justify", e.wordGap ?? 2), `page${e.pageNumber}.tsx`)}>TSX</button>
                         </div>
                       </div>
                     );
                   })}
                 </div>
-                <pre style={{ ...S.pre, maxHeight: 320 }}>{generateMushafManager(history, allOffsets, lineGap)}</pre>
+                <pre style={{ ...S.pre, maxHeight: 320 }}>{generateMushafManager(history)}</pre>
               </>
             )}
           </section>

@@ -1,0 +1,2239 @@
+{
+  "1":{"1": ["1:1"] , },
+
+  "2":{
+      "1": ["1"],
+      "2": ["2"],
+      "3": ["3"],
+      "4": ["4"],
+      "5": ["5", "6"]
+    },
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Quran Page Processor — Text Edition v8
+// Renders dataTxt with AALMAGHRIBI font instead of SVGs
+// searchTxtManual = per-word copy text (split from copyData)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { useState, useCallback, useRef, useEffect } from "react";
+
+function loadJSZip(): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (typeof window !== "undefined" && (window as any).JSZip) { resolve((window as any).JSZip); return; }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    script.onload = () => resolve((window as any).JSZip);
+    script.onerror = () => reject(new Error("Failed to load JSZip"));
+    document.head.appendChild(script);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const SETTINGS_KEY = "qproc_settings_v15";
+const IDB_NAME    = "qproc_db";
+const IDB_VERSION = 1;
+const IDB_STORE   = "pages";
+const BACKUP_VERSION    = 4;
+const BACKUP_CHUNK_SIZE = 30;
+
+const WARSH_RECITERS: Record<string, { name: string; path: string }> = {
+  warsh_husary:  { name: "ورش — الحصري",    path: "Husary_Warsh_128kbps"   },
+  warsh_mushary: { name: "ورش — المشاري",   path: "Minshawy_Warsh_128kbps" },
+  warsh_ayyoub:  { name: "ورش — أيوب",      path: "Ayyoub_Warsh_128kbps"   },
+  warsh_absawi:  { name: "ورش — الأبصيري",  path: "Absawi_Warsh_128kbps"   },
+};
+const DEFAULT_WARSH = "warsh_husary";
+const TAFSIR_SOURCES: Record<string, { name: string; id: number }> = {
+  muyassar:   { name: "الميسر",    id: 1  },
+  jalalayn:   { name: "الجلالين",  id: 2  },
+  saadi:      { name: "السعدي",    id: 3  },
+  ibn_kathir: { name: "ابن كثير",  id: 4  },
+  baghawy:    { name: "البغوي",    id: 6  },
+  tabari:     { name: "الطبري",    id: 8  },
+  qortoby:    { name: "القرطبي",   id: 9  },
+  ibn_ashoor: { name: "ابن عاشور", id: 10 },
+};
+const DEFAULT_TAFSIR = "ibn_kathir";
+
+const HIZB_MARKERS: Record<string, { label: string; fraction: number; symbol: string }> = {
+  "®": { label: "ثمن", fraction: 0.125, symbol: "⅛" },
+  "©": { label: "ربع", fraction: 0.125, symbol: "¼" },
+  "¥": { label: "نصف", fraction: 0.125, symbol: "½" },
+  "¤": { label: "حزب", fraction: .125,  symbol: "◉" },
+};
+
+const LAYOUT_TITLE_PAGES = new Set([1, 2]);
+
+function getDefaultLayout(pageNumber: number): { pageAlign: HistoryEntry["pageAlign"]; wordGap: number } {
+  if (LAYOUT_TITLE_PAGES.has(pageNumber)) return { pageAlign: "center", wordGap: 8 };
+  return { pageAlign: "justify", wordGap: 55 };
+}
+
+// Arabic letter palette — full keyboard for editing
+const ARABIC_LETTERS: string[][] = [
+  ["ض","ص","ث","ق","ف","غ","ع","ه","خ","ح","ج","د"],
+  ["ش","س","ي","ب","ل","ا","ت","ن","م","ك","ط","ذ"],
+  ["ئ","ء","ؤ","ر","لا","ى","ة","و","ز","ظ"],
+  ["َ","ُ","ِ","ً","ٌ","ٍ","ْ","ّ","ٰ","ۡ","ۚ","ۖ","ۗ","ۘ","ۙ","ۛ"],
+  ["ٱ","آ","أ","إ","ؤ","ئ","ﷺ","ﷻ","۩","﴾","﴿","۞"],
+];
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ══════════════════════════════════════════════════════════════════════════════
+
+interface HizbMark {
+  label: string; fraction: number; symbol: string;
+  hizbIndex: number; hizbFraction: number; positionId: string;
+}
+
+interface WordToken {
+  dataTxt: string; searchTxtAuto: string; searchTxtManual: string;
+  classList: string[]; wid: number | null; aid: number | null; atid: number | null;
+  isAyahMarker: boolean; ayahNumber: number | null; surahNumber: number;
+  hizbMark: HizbMark | null;
+}
+
+interface LineToken { words: WordToken[] }
+
+interface AyahGroup {
+  aid: number; ayahNum: number; surahNumber: number; words: WordToken[];
+  isComplete: boolean; continuesFromPrev: boolean; copyTxt: string;
+}
+
+interface SurahSegment {
+  surahNumber: number; surahTitle: string | null; ayahs: AyahGroup[];
+}
+
+interface ParsedPage {
+  pageNumber: number; surahNumbers: number[]; segments: SurahSegment[];
+  lines: LineToken[]; hizbMarks: HizbMark[]; hizbAtStart: number; hasSajda: boolean;
+}
+
+interface HistoryEntry {
+  id: string; pageNumber: number; surahNumbers: number[]; label: string;
+  parsed: ParsedPage; tsx: string; savedAt: number;
+  searchOverrides: Record<string, string>;
+  copyOverrides:   Record<string, string>;
+  // per-word manual edits: wordId -> edited dataTxt
+  wordEdits: Record<string, string>;
+  pageAlign: "center" | "justify" | "flex-start" | "flex-end";
+  wordGap:   number;
+  fontSize:  number;
+  lineGap:   number;
+}
+
+type HafsWarshMap = Record<string, Record<string, string[]>>;
+const DEFAULT_HAFS_WARSH_MAP: HafsWarshMap = {};
+
+interface Annotation {
+  id: string; type: "tafsir" | "riwaya"; targetType: "word" | "ayah" | "surah";
+  targetKey: string; title: string; body: string; source: string;
+}
+type AnnotationStore = Record<string, Record<string, Annotation>>;
+
+interface ImportItem {
+  id: string; file: File; filename: string; pageNumber: number;
+  surahInput: string; html: string;
+  status: "pending" | "processing" | "done" | "error"; error?: string;
+}
+
+type Step     = "idle" | "parsing" | "done" | "error";
+type MainView = "processor" | "import" | "history" | "previewer" | "manager" | "mapping";
+
+interface Settings {
+  allColors: Record<string, Record<string, string>>;
+  annotations: AnnotationStore; hizbCursor: number;
+  lastPageNumber: number; hafsWarshMap: HafsWarshMap;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ARABIC NORMALIZATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+function normalizeArabic(text: string): string {
+  if (!text) return "";
+  let s = text;
+  s = s.replace(/[\u064B-\u065F]/g, "");
+  s = s.replace(/\u0640/g, "");
+  s = s.replace(/\u0670/g, "");
+  s = s.replace(/[\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]/g, "");
+  s = s.replace(/[\u06DD\u06DE]/g, "");
+  s = s.replace(/[\u0622\u0623\u0625\u0671]/g, "\u0627");
+  s = s.replace(/\u0649/g, "\u064A");
+  s = s.replace(/\u0629/g, "\u0647");
+  s = s.replace(/[^\u0600-\u06FF\s\(\)]/g, "");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HIZB DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+function detectHizbMark(dataTxt: string): { label: string; fraction: number; symbol: string } | null {
+  const stripped = dataTxt.replace(/[\u064B-\u065F\u0640\u0670]/g, "").trim();
+  for (const [key, val] of Object.entries(HIZB_MARKERS)) {
+    if (stripped.includes(key)) return val;
+  }
+  if (dataTxt.includes("\u06DE")) return { label: "حزب", fraction: 1,    symbol: "◉" };
+  if (dataTxt.includes("\u06DD")) return { label: "ربع", fraction: 0.25, symbol: "¼" };
+  return null;
+}
+
+function buildPositionId(label: string, hizbFraction: number): string {
+  const totalEighths = Math.round(hizbFraction / 0.125);
+  if (totalEighths === 0) return "hizb_start";
+  const hizbN = Math.ceil(totalEighths / 8);
+  const posInHizb = ((totalEighths - 1) % 8) + 1;
+  const POSITION_NAMES: Record<number, string> = {
+    1: "ثمن_1", 2: "ربع_2", 3: "ثمن_3", 4: "نصف_4",
+    5: "ثمن_5", 6: "ربع_6", 7: "ثمن_7", 8: "حزب",
+  };
+  return `hizb_${hizbN}_${POSITION_NAMES[posInHizb] ?? `pos_${posInHizb}`}`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUT SANITIZER
+// ══════════════════════════════════════════════════════════════════════════════
+
+function unescapeInput(raw: string): string {
+  if (!raw.includes("\\")) return raw;
+  return raw
+    .replace(/\\"/g, '"').replace(/\\'/g, "'")
+    .replace(/\\n/g, "\n").replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t").replace(/\\\//g, "/")
+    .replace(/\\\\/g, "\\");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PARSER
+// ══════════════════════════════════════════════════════════════════════════════
+
+function parseQuranHtml(
+  rawHtml: string, pageNumber: number, surahNumbers: number[], hizbCursorIn: number,
+): { result: ParsedPage; hizbCursorOut: number } {
+  const html = unescapeInput(rawHtml);
+  const container = document.createElement("div");
+  container.innerHTML = html;
+  const page = container.querySelector(".page") ?? container;
+
+  let surahPointer = 0;
+  const currentSurahNum = () => surahNumbers[Math.min(surahPointer, surahNumbers.length - 1)];
+
+  const lines: LineToken[] = [];
+  let currentLine: WordToken[] = [];
+  const segmentMap = new Map<number, { surahTitle: string | null; ayahWords: Map<number, WordToken[]> }>();
+  const ensureSegment = (sn: number) => {
+    if (!segmentMap.has(sn)) segmentMap.set(sn, { surahTitle: null, ayahWords: new Map() });
+    return segmentMap.get(sn)!;
+  };
+
+  let hizbCursor = hizbCursorIn;
+  const hizbMarks: HizbMark[] = [];
+
+  for (const el of Array.from(page.children) as HTMLElement[]) {
+    const cls = Array.from(el.classList);
+
+    if (cls.includes("suraTitle")) {
+      ensureSegment(currentSurahNum()).surahTitle = el.getAttribute("data-txt") ?? el.textContent ?? null;
+      surahPointer = Math.min(surahPointer + 1, surahNumbers.length - 1);
+      continue;
+    }
+
+    if (cls.includes("classLineEnd") || cls.includes("lastWordInLine") || cls.includes("lastWordInPage")) {
+      if (currentLine.length > 0) { lines.push({ words: [...currentLine] }); currentLine = []; }
+      continue;
+    }
+
+    if (cls.includes("word")) {
+      const dataTxt = el.getAttribute("data-txt") ?? el.textContent ?? "";
+      if (!dataTxt && (cls.includes("lastWordInPage") || cls.includes("lastWordInLine"))) continue;
+
+      const widMatch  = cls.find((c) => c.startsWith("wid_"));
+      const aidMatch  = cls.find((c) => c.startsWith("aid_"));
+      const atidMatch = cls.find((c) => c.startsWith("atid_"));
+      const anMatch   = cls.find((c) => c.startsWith("an_"));
+
+      const wid          = widMatch  ? parseInt(widMatch.split("_")[1])  : null;
+      const aid          = aidMatch  ? parseInt(aidMatch.split("_")[1])  : null;
+      const atid         = atidMatch ? parseInt(atidMatch.split("_")[1]) : null;
+      const isAyahMarker = cls.includes("aya");
+      const ayahNumber   = anMatch   ? parseInt(anMatch.split("_")[1])   : null;
+      const sn           = currentSurahNum();
+
+      const hizbDef = detectHizbMark(dataTxt);
+      let hizbMark: HizbMark | null = null;
+      if (hizbDef) {
+        hizbCursor += hizbDef.fraction;
+        hizbMark = {
+          ...hizbDef,
+          hizbIndex:    Math.ceil(hizbCursor),
+          hizbFraction: hizbCursor,
+          positionId:   buildPositionId(hizbDef.label, hizbCursor),
+        };
+        hizbMarks.push(hizbMark);
+      }
+
+      const word: WordToken = {
+        dataTxt, searchTxtAuto: normalizeArabic(dataTxt), searchTxtManual: "",
+        classList: cls, wid, aid, atid, isAyahMarker, ayahNumber, surahNumber: sn, hizbMark,
+      };
+
+      currentLine.push(word);
+      if (aid !== null) {
+        const seg = ensureSegment(sn);
+        if (!seg.ayahWords.has(aid)) seg.ayahWords.set(aid, []);
+        seg.ayahWords.get(aid)!.push(word);
+      }
+    }
+  }
+
+  if (currentLine.length > 0) lines.push({ words: [...currentLine] });
+
+  const segments: SurahSegment[] = [];
+  for (const sn of surahNumbers) {
+    const seg = segmentMap.get(sn);
+    if (!seg) continue;
+    const ayahs: AyahGroup[] = [];
+    for (const aid of Array.from(seg.ayahWords.keys()).sort((a, b) => a - b)) {
+      const words = seg.ayahWords.get(aid)!;
+      const hasMarker = words.some((w) => w.isAyahMarker);
+      const continuesFromPrev = ayahs.length === 0 && !words[0].isAyahMarker &&
+        !words.some((w) => w.ayahNumber !== null && w.ayahNumber === aid);
+      const markerWord  = words.find((w) => w.isAyahMarker && w.ayahNumber !== null);
+      const contentWord = words.find((w) => !w.isAyahMarker && w.ayahNumber !== null && w.ayahNumber > 0);
+      const ayahNumRaw  = markerWord?.ayahNumber ?? contentWord?.ayahNumber ?? null;
+      const ayahNum = ayahNumRaw ?? -1;
+      ayahs.push({ aid, ayahNum, surahNumber: sn, words, isComplete: hasMarker, continuesFromPrev, copyTxt: "" });
+    }
+    for (let i = 0; i < ayahs.length; i++) {
+      if (ayahs[i].ayahNum === -1) {
+        if (i + 1 < ayahs.length && ayahs[i + 1].ayahNum > 0) {
+          ayahs[i] = { ...ayahs[i], ayahNum: ayahs[i + 1].ayahNum - 1 };
+        } else {
+          ayahs[i] = { ...ayahs[i], ayahNum: 0 };
+        }
+      }
+    }
+    segments.push({ surahNumber: sn, surahTitle: seg.surahTitle, ayahs });
+  }
+
+  const hasSajda = lines.some((l) => l.words.some((w) => w.dataTxt.includes("¦")));
+
+  return {
+    result: { pageNumber, surahNumbers, segments, lines, hizbMarks, hizbAtStart: hizbCursorIn, hasSajda },
+    hizbCursorOut: hizbCursor,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TSX GENERATOR (text-based)
+// ══════════════════════════════════════════════════════════════════════════════
+
+function generateTsx(
+  parsed: ParsedPage,
+  searchOverrides: Record<string, string> = {},
+  copyOverrides: Record<string, string> = {},
+  wordEdits: Record<string, string> = {},
+  entryAnnotations: Record<string, Annotation> = {},
+  pageAlign: HistoryEntry["pageAlign"] = "justify",
+  wordGap: number = 55,
+  fontSize: number = 32,
+  lineGap: number = 8,
+): string {
+  const { pageNumber, surahNumbers, segments, lines, hizbMarks, hizbAtStart } = parsed;
+
+  const linesCode = lines.map((line, li) => {
+    const wordsCode = line.words.map((w) => {
+      const uid = w.wid !== null ? `word_${w.wid}_page_${pageNumber}` : `word_p${pageNumber}_l${li}`;
+      const displayTxt = wordEdits[uid] ?? w.dataTxt;
+      const hizbStr = w.hizbMark
+        ? `, hizbMark: { label: ${JSON.stringify(w.hizbMark.label)}, fraction: ${w.hizbMark.fraction}, symbol: ${JSON.stringify(w.hizbMark.symbol)}, hizbIndex: ${w.hizbMark.hizbIndex}, hizbFraction: ${w.hizbMark.hizbFraction}, positionId: ${JSON.stringify(w.hizbMark.positionId)} }`
+        : "";
+      const wordAnns  = Object.values(entryAnnotations).filter((a) => a.targetKey === uid);
+      const tafsirStr = wordAnns.filter((a) => a.type === "tafsir").length > 0
+        ? `, tafsir: ${JSON.stringify(wordAnns.filter((a) => a.type === "tafsir").map((a) => ({ title: a.title, body: a.body, source: a.source })))}`
+        : "";
+      return [
+        `    {`,
+        `      id: ${JSON.stringify(uid)},`,
+        `      dataTxt: ${JSON.stringify(displayTxt)},`,
+        `      searchTxtAuto: ${JSON.stringify(w.searchTxtAuto)},`,
+        `      searchTxtManual: ${JSON.stringify(w.searchTxtManual)},`,
+        `      ayahId: ${w.aid ?? "null"}, surahNumber: ${w.surahNumber},`,
+        `      isAyahMarker: ${w.isAyahMarker}, ayahNumber: ${w.ayahNumber ?? "null"}, isSajda: ${w.dataTxt.includes("\u00A6")}${hizbStr}${tafsirStr},`,
+        `    }`,
+      ].join("\n");
+    }).join(",\n");
+    return `  {\n    lineIndex: ${li + 1}, pageNumber: ${pageNumber},\n    words: [\n${wordsCode}\n    ]\n  }`;
+  }).join(",\n");
+
+  const segmentsCode = segments.map((seg) => {
+    const ayahsCode = seg.ayahs.map((a) => {
+      const contentWords     = a.words.filter((w) => !w.isAyahMarker);
+      const textDataAuto     = contentWords.map((w) => w.dataTxt).filter(Boolean).join(" ");
+      const searchDataAuto   = contentWords.map((w) => w.searchTxtAuto).filter(Boolean).join(" ");
+      const overrideKey      = `${seg.surahNumber}:${a.ayahNum}`;
+      const searchDataManual = searchOverrides[overrideKey] ?? "";
+      const copyDataManual   = (copyOverrides ?? {})[overrideKey] ?? "";
+      // Per-word copy (searchTxtManual) — already stored on words
+      const isCopyStart  = !a.continuesFromPrev;
+      const isCopyEnd    = a.isComplete;
+      const isCopyComplete = isCopyStart && isCopyEnd;
+      const ayahKey   = `ayah_${seg.surahNumber}_${a.aid}`;
+      const ayahAnns  = Object.values(entryAnnotations).filter((ann) => ann.targetKey === ayahKey);
+      const tafsirStr = ayahAnns.filter((a) => a.type === "tafsir").length > 0
+        ? `,\n      tafsir: ${JSON.stringify(ayahAnns.filter((a) => a.type === "tafsir").map((a) => ({ title: a.title, body: a.body, source: a.source })))}` : "";
+      return [
+        `    {`,
+        `      ayahId: ${a.aid}, ayahNum: ${a.ayahNum}, surahNumber: ${seg.surahNumber}, pageNumber: ${pageNumber},`,
+        `      isComplete: ${a.isComplete}, continuesFromPrev: ${a.continuesFromPrev},`,
+        `      textData: ${JSON.stringify(textDataAuto)},`,
+        `      searchDataAuto: ${JSON.stringify(searchDataAuto)},`,
+        `      searchDataManual: ${JSON.stringify(searchDataManual)},`,
+        `      copyData: ${JSON.stringify(copyDataManual)},`,
+        `      isCopyComplete: ${isCopyComplete}, isCopyStart: ${isCopyStart}, isCopyEnd: ${isCopyEnd}${tafsirStr},`,
+        `    }`,
+      ].join("\n");
+    }).join(",\n");
+    return `  {\n    surahNumber: ${seg.surahNumber}, surahTitle: ${JSON.stringify(seg.surahTitle)},\n    ayahs: [\n${ayahsCode}\n    ]\n  }`;
+  }).join(",\n");
+
+  const hizbCode = hizbMarks.map((h) =>
+    `  { label: ${JSON.stringify(h.label)}, symbol: ${JSON.stringify(h.symbol)}, fraction: ${h.fraction}, hizbIndex: ${h.hizbIndex}, hizbFraction: ${h.hizbFraction}, positionId: ${JSON.stringify(h.positionId)} }`
+  ).join(",\n");
+
+  return `// AUTO-GENERATED — Page ${pageNumber} | Surah ${surahNumbers.join(", ")}
+// hizbAtStart: ${hizbAtStart.toFixed(3)} | hizbAtEnd: ${hizbMarks.length > 0 ? hizbMarks[hizbMarks.length-1].hizbFraction.toFixed(3) : hizbAtStart.toFixed(3)}
+// Font: AALMAGHRIBI | fontSize: ${fontSize}px | lineGap: ${lineGap}px | align: ${pageAlign}
+
+import React from "react";
+
+export const PAGE_NUMBER    = ${pageNumber};
+export const SURAH_NUMBERS  = [${surahNumbers.join(", ")}];
+export const HIZB_AT_START  = ${hizbAtStart};
+export const FONT_SIZE_PX   = ${fontSize};
+export const LINE_GAP_PX    = ${lineGap};
+export const PAGE_ALIGN     = "${pageAlign}";
+export const WORD_GAP_PX    = ${wordGap};
+export const HAS_SAJDA      = ${parsed.hasSajda};
+
+export interface WordData {
+  id: string; dataTxt: string; searchTxtAuto: string; searchTxtManual: string;
+  ayahId: number | null; surahNumber: number; isAyahMarker?: boolean;
+  ayahNumber?: number | null;
+  hizbMark?: { label: string; symbol: string; fraction: number; hizbIndex: number; hizbFraction: number; positionId: string } | null;
+  tafsir?: { title: string; body: string; source: string }[];
+  isSajda?: boolean;
+}
+
+export interface AyahData {
+  ayahId: number; ayahNum: number; surahNumber: number; pageNumber: number;
+  isComplete: boolean; continuesFromPrev: boolean;
+  textData: string; searchDataAuto: string; searchDataManual: string;
+  copyData: string; isCopyComplete: boolean; isCopyStart: boolean; isCopyEnd: boolean;
+  tafsir?: { title: string; body: string; source: string }[];
+}
+
+export interface SegmentData { surahNumber: number; surahTitle: string | null; ayahs: AyahData[] }
+export interface LineData    { lineIndex: number; pageNumber: number; words: WordData[] }
+export interface HizbData    { label: string; symbol: string; fraction: number; hizbIndex: number; hizbFraction: number; positionId: string }
+
+export const lines: LineData[] = [
+${linesCode}
+];
+
+export const segments: SegmentData[] = [
+${segmentsCode}
+];
+
+export const hizbMarks: HizbData[] = [
+${hizbCode}
+];
+
+function Word({ id, dataTxt, isAyahMarker, ayahNumber, hizbMark, tafsir, isSajda }: WordData) {
+  return (
+    <span
+      id={id}
+      className={[
+        "qword",
+        isAyahMarker ? "qword--ayah-marker" : "",
+        hizbMark ? \`qword--hizb-\${hizbMark.label}\` : "",
+        tafsir?.length ? "qword--has-tafsir" : "",
+        isSajda ? "qword--sajda" : "",
+      ].filter(Boolean).join(" ")}
+      data-txt={dataTxt}
+      data-ayah-number={ayahNumber ?? undefined}
+      data-hizb-pos={hizbMark?.positionId}
+      style={{ fontFamily: "AALMAGHRIBI, serif", fontSize: FONT_SIZE_PX }}
+    >
+      {dataTxt}
+    </span>
+  );
+}
+
+function Line({ lineIndex, pageNumber, words }: LineData) {
+  const justify = PAGE_ALIGN === "justify";
+  return (
+    <div className="qline" data-line={lineIndex} data-page={pageNumber}
+      style={{
+        marginBottom: LINE_GAP_PX,
+        display: "flex",
+        flexDirection: "row",
+        justifyContent: justify ? "space-between" : PAGE_ALIGN,
+        gap: justify ? 0 : WORD_GAP_PX,
+        direction: "rtl",
+      }}>
+      {words.map((w) => <Word key={w.id} {...w} />)}
+    </div>
+  );
+}
+
+export function Page${pageNumber}() {
+  return (
+    <div className="qpage" id={\`page_${pageNumber}\`} data-page={${pageNumber}} data-hizb-start="${hizbAtStart}"
+      style={{ fontFamily: "AALMAGHRIBI, serif", direction: "rtl" }}>
+      {segments.map((seg) =>
+        seg.surahTitle
+          ? <div key={seg.surahNumber} className="qsurah-title" data-surah={seg.surahNumber} style={{ textAlign: "center", fontFamily: "AALMAGHRIBI, serif", fontSize: FONT_SIZE_PX * 1.2 }}>{seg.surahTitle}</div>
+          : null
+      )}
+      {lines.map((l) => <Line key={\`line-\${l.lineIndex}\`} {...l} />)}
+    </div>
+  );
+}
+
+export default Page${pageNumber};
+`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MUSHAF MANAGER GENERATOR
+// ══════════════════════════════════════════════════════════════════════════════
+
+function generateMushafManager(entries: HistoryEntry[]): string {
+  const sorted = [...entries].sort((a, b) => a.pageNumber - b.pageNumber);
+  const imports = sorted.map((e) =>
+    `import { lines as p${e.pageNumber}Lines, segments as p${e.pageNumber}Segs, hizbMarks as p${e.pageNumber}Hizb, HIZB_AT_START as h${e.pageNumber}, FONT_SIZE_PX as f${e.pageNumber} } from "./pages/Page${e.pageNumber}";`
+  ).join("\n");
+  const pagesArray = sorted.map((e) =>
+    `  { pageNumber: ${e.pageNumber}, surahNumbers: [${e.surahNumbers.join(", ")}], label: ${JSON.stringify(e.label)}, lines: p${e.pageNumber}Lines, segments: p${e.pageNumber}Segs, hizbMarks: p${e.pageNumber}Hizb, hizbAtStart: h${e.pageNumber}, fontSize: f${e.pageNumber} }`
+  ).join(",\n");
+
+  return `// AUTO-GENERATED — MushafManager (text edition)
+// Pages: ${sorted.map((e) => e.pageNumber).join(", ")}
+
+import React, { useState } from "react";
+${imports}
+
+export const MUSHAF_PAGES = [
+${pagesArray}
+];
+
+export function MushafManager() {
+  const [idx, setIdx] = useState(0);
+  const page = MUSHAF_PAGES[idx];
+  if (!page) return <div>No pages.</div>;
+  const go = (i: number) => setIdx(Math.max(0, Math.min(MUSHAF_PAGES.length - 1, i)));
+  return (
+    <div className="mushaf-manager" style={{ direction: "rtl" }}>
+      <nav style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <button onClick={() => go(idx - 1)} disabled={idx === 0}>◀</button>
+        <span>P{page.pageNumber} | Surah {page.surahNumbers.join(",")}</span>
+        <button onClick={() => go(idx + 1)} disabled={idx === MUSHAF_PAGES.length - 1}>▶</button>
+      </nav>
+      <div className="mushaf-page" data-page={page.pageNumber} style={{ fontFamily: "AALMAGHRIBI, serif" }}>
+        {page.segments.map((seg: any) =>
+          seg.surahTitle ? <div key={seg.surahNumber} style={{ textAlign: "center", fontSize: page.fontSize * 1.2 }}>{seg.surahTitle}</div> : null
+        )}
+        {page.lines.map((line: any) => (
+          <div key={line.lineIndex} style={{ display: "flex", flexDirection: "row", direction: "rtl", marginBottom: 8 }}>
+            {line.words.map((w: any) => (
+              <span key={w.id} id={w.id} data-txt={w.dataTxt} style={{ fontSize: page.fontSize, fontFamily: "AALMAGHRIBI, serif" }}>
+                {w.dataTxt}
+              </span>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+export default MushafManager;
+`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STORAGE (IndexedDB)
+// ══════════════════════════════════════════════════════════════════════════════
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE, { keyPath: "id" });
+    };
+    req.onsuccess = (e) => resolve((e.target as IDBOpenDBRequest).result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+async function idbGetAll(): Promise<HistoryEntry[]> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, "readonly").objectStore(IDB_STORE).getAll();
+    req.onsuccess = () => resolve((req.result ?? []) as HistoryEntry[]);
+    req.onerror   = () => reject(req.error);
+  });
+}
+async function idbPut(entry: HistoryEntry): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, "readwrite").objectStore(IDB_STORE).put(entry);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+async function idbDelete(id: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, "readwrite").objectStore(IDB_STORE).delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+async function idbClear(): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, "readwrite").objectStore(IDB_STORE).clear();
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+async function idbPutMany(entries: HistoryEntry[]): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    for (const e of entries) tx.objectStore(IDB_STORE).put(e);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+function defaultSettings(): Settings {
+  return { allColors: {}, annotations: {}, hizbCursor: 0, lastPageNumber: 1, hafsWarshMap: {} };
+}
+function loadSettings(): Settings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return defaultSettings();
+    const p = JSON.parse(raw) as Partial<Settings>;
+    const d = defaultSettings();
+    return {
+      allColors:      p.allColors   ?? d.allColors,
+      annotations:    p.annotations ?? d.annotations,
+      hizbCursor:     typeof p.hizbCursor === "number" ? p.hizbCursor : d.hizbCursor,
+      lastPageNumber: typeof p.lastPageNumber === "number" ? p.lastPageNumber : d.lastPageNumber,
+      hafsWarshMap:   p.hafsWarshMap ?? d.hafsWarshMap,
+    };
+  } catch { return defaultSettings(); }
+}
+let _settingsTimer: ReturnType<typeof setTimeout> | null = null;
+function saveSettings(s: Settings) {
+  if (_settingsTimer) clearTimeout(_settingsTimer);
+  _settingsTimer = setTimeout(() => {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
+  }, 300);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BACKUP
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function exportBackup(history: HistoryEntry[], settings: Settings, onProgress?: (done: number, total: number) => void): Promise<void> {
+  const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+  const date   = new Date().toISOString().slice(0, 10);
+  const dl2 = (blob: Blob, name: string) => new Promise<void>((resolve) => {
+    const url = URL.createObjectURL(blob); const a = document.createElement("a");
+    a.href = url; a.download = name; a.click(); setTimeout(() => { URL.revokeObjectURL(url); resolve(); }, 2000);
+  });
+  if (sorted.length <= BACKUP_CHUNK_SIZE) {
+    await dl2(new Blob([JSON.stringify({ _version: BACKUP_VERSION, _date: new Date().toISOString(), _chunks: 1, _chunk: 1, settings, pages: sorted })], { type: "application/json" }), `quran-backup-${date}-${sorted.length}pages.json`);
+    onProgress?.(sorted.length, sorted.length); return;
+  }
+  const chunks: HistoryEntry[][] = [];
+  for (let i = 0; i < sorted.length; i += BACKUP_CHUNK_SIZE) chunks.push(sorted.slice(i, i + BACKUP_CHUNK_SIZE));
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const payload: any = { _version: BACKUP_VERSION, _date: new Date().toISOString(), _chunks: chunks.length, _chunk: ci + 1 };
+    if (ci === 0) payload.settings = settings;
+    payload.pages = chunks[ci];
+    await dl2(new Blob([JSON.stringify(payload)], { type: "application/json" }), `quran-backup-${date}-part${ci + 1}of${chunks.length}.json`);
+    onProgress?.(Math.min((ci + 1) * BACKUP_CHUNK_SIZE, sorted.length), sorted.length);
+    await new Promise<void>((r) => setTimeout(r, 500));
+  }
+}
+
+function importBackup(file: File): Promise<{ pages: HistoryEntry[]; settings: Settings; isChunk: boolean; chunkInfo?: string }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const raw = JSON.parse(e.target?.result as string);
+        const d   = defaultSettings();
+        const ex  = (src: any): Settings => {
+          const s = (src.settings ?? src) as Partial<Settings>;
+          return { allColors: s.allColors ?? d.allColors, annotations: s.annotations ?? d.annotations, hizbCursor: typeof s.hizbCursor === "number" ? s.hizbCursor : d.hizbCursor, lastPageNumber: s.lastPageNumber ?? d.lastPageNumber, hafsWarshMap: s.hafsWarshMap ?? d.hafsWarshMap };
+        };
+        if (Array.isArray(raw.pages)) {
+          const isChunk = (raw._chunks ?? 1) > 1;
+          resolve({ pages: raw.pages as HistoryEntry[], settings: raw.settings ? ex(raw) : d, isChunk, chunkInfo: isChunk ? `جزء ${raw._chunk} من ${raw._chunks}` : undefined });
+          return;
+        }
+        if (Array.isArray(raw.history)) { resolve({ pages: raw.history as HistoryEntry[], settings: ex(raw), isChunk: false }); return; }
+        reject(new Error("تنسيق غير معروف"));
+      } catch (err: any) { reject(new Error("ملف تالف: " + err.message)); }
+    };
+    reader.onerror = () => reject(new Error("فشل قراءة الملف"));
+    reader.readAsText(file);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HAFS / WARSH MAPPING HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+function warshToHafs(map: HafsWarshMap, surah: number, warshAyah: number): number {
+  const surahMap = map[String(surah)];
+  if (!surahMap) return warshAyah;
+  for (const [hafsStr, warshList] of Object.entries(surahMap)) {
+    if (warshList.includes(String(warshAyah))) return parseInt(hafsStr);
+  }
+  return warshAyah;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROCESS ONE PAGE
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function processOnePage(
+  html: string, pageNumber: number, surahNumbers: number[], hizbCursor: number,
+): Promise<{ entry: Omit<HistoryEntry, "searchOverrides" | "copyOverrides" | "wordEdits">; hizbCursorOut: number }> {
+  const { result: parsed, hizbCursorOut } = parseQuranHtml(html, pageNumber, surahNumbers, hizbCursor);
+  const tsx   = generateTsx(parsed);
+  const label = `Page ${pageNumber} — Surah ${surahNumbers.join(", ")}`;
+  const defaults = getDefaultLayout(pageNumber);
+  return {
+    entry: { id: `p${pageNumber}_${Date.now()}`, pageNumber, surahNumbers, label, parsed, tsx, savedAt: Date.now(), pageAlign: defaults.pageAlign, wordGap: defaults.wordGap, fontSize: 32, lineGap: 8 },
+    hizbCursorOut,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TAFSIR API
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function fetchTafsirRange(surah: number, tafsirId: number, startAyah: number, endAyah: number): Promise<Record<number, string>> {
+  const url  = `https://api.quran-tafseer.com/tafseer/${tafsirId}/${surah}/${startAyah}/${endAyah}`;
+  const attempts = [
+    () => fetch(url),
+    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`),
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`),
+  ];
+  let data: any = null;
+  for (const attempt of attempts) {
+    try {
+      const r = await attempt();
+      if (!r.ok) continue;
+      const text = await r.text();
+      if (!text.trim()) continue;
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].ayah_number !== undefined) { data = parsed; break; }
+      if (parsed?.ayah_number !== undefined) { data = [parsed]; break; }
+    } catch {}
+  }
+  if (!data) throw new Error(`فشل جلب التفسير للسورة ${surah} الآيات ${startAyah}-${endAyah}`);
+  const result: Record<number, string> = {};
+  for (const item of data) {
+    const num = parseInt(String(item.ayah_number ?? 0));
+    if (!isNaN(num)) result[num] = String(item.text ?? "").replace(/<[^>]*>/g, "").trim();
+  }
+  return result;
+}
+
+function warshAudioUrl(surah: number, ayah: number, reciter: string = DEFAULT_WARSH): string {
+  const path = WARSH_RECITERS[reciter]?.path ?? WARSH_RECITERS[DEFAULT_WARSH].path;
+  return `https://everyayah.com/data/${path}/${String(surah).padStart(3, "0")}${String(ayah).padStart(3, "0")}.mp3`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ARABIC LETTER PALETTE COMPONENT
+// ══════════════════════════════════════════════════════════════════════════════
+
+function ArabicLetterPalette({ onInsert }: { onInsert: (char: string) => void }) {
+  const rowLabels = ["حروف", "حروف", "حروف", "تشكيل", "خاص"];
+  return (
+    <div style={{ background: "#0a0c10", border: "1px solid #2a2f3e", borderRadius: 8, padding: "10px 10px 6px", display: "flex", flexDirection: "column", gap: 5 }}>
+      <div style={{ fontSize: 9, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>🔤 لوحة الحروف</div>
+      {ARABIC_LETTERS.map((row, ri) => (
+        <div key={ri} style={{ display: "flex", flexWrap: "wrap", gap: 3, paddingBottom: 4, borderBottom: ri < ARABIC_LETTERS.length - 1 ? "1px solid #1e2332" : "none" }}>
+          <span style={{ fontSize: 8, color: "#4b5563", width: 28, display: "flex", alignItems: "center" }}>{rowLabels[ri]}</span>
+          {row.map((ch) => (
+            <button
+              key={ch}
+              onClick={() => onInsert(ch)}
+              title={`Insert: ${ch}`}
+              style={{
+                background: "#1e2332", border: "1px solid #2a2f3e", borderRadius: 4,
+                color: "#e8e6e0", fontSize: 16, fontFamily: "AALMAGHRIBI, serif",
+                cursor: "pointer", width: 34, height: 32, display: "flex", alignItems: "center", justifyContent: "center",
+                transition: "all 0.12s",
+              }}
+              onMouseEnter={(e) => { (e.target as HTMLElement).style.background = "#c9a96e33"; (e.target as HTMLElement).style.borderColor = "#c9a96e66"; }}
+              onMouseLeave={(e) => { (e.target as HTMLElement).style.background = "#1e2332"; (e.target as HTMLElement).style.borderColor = "#2a2f3e"; }}
+            >
+              {ch}
+            </button>
+          ))}
+        </div>
+      ))}
+      <div style={{ fontSize: 9, color: "#4b5563", marginTop: 2, direction: "rtl" }}>انقر على حرف لإدراجه في الكلمة المحددة</div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WORD EDITOR — click a word to edit its dataTxt inline
+// ══════════════════════════════════════════════════════════════════════════════
+
+interface WordEditorProps {
+  entry: HistoryEntry;
+  wordEdits: Record<string, string>;
+  onWordEdit: (wordId: string, newTxt: string) => void;
+  pageAlign: HistoryEntry["pageAlign"];
+  wordGap: number;
+  fontSize: number;
+  lineGap: number;
+  onPageAlignChange: (v: HistoryEntry["pageAlign"]) => void;
+  onWordGapChange: (v: number) => void;
+  onFontSizeChange: (v: number) => void;
+  onLineGapChange: (v: number) => void;
+  onApplyToAll: (field: "wordGap" | "fontSize" | "lineGap", value: number) => void;
+}
+
+function WordEditor({ entry, wordEdits, onWordEdit, pageAlign, wordGap, fontSize, lineGap, onPageAlignChange, onWordGapChange, onFontSizeChange, onLineGapChange, onApplyToAll }: WordEditorProps) {
+  const [selectedWordId, setSelectedWordId] = useState<string | null>(null);
+  const [editingWordId,  setEditingWordId]  = useState<string | null>(null);
+  const [editValue,      setEditValue]      = useState("");
+  const [showPalette,    setShowPalette]    = useState(true);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Find selected word token
+  const allWords = entry.parsed.lines.flatMap((l) => l.words);
+  const selectedWord = allWords.find((w) => {
+    const uid = w.wid !== null ? `word_${w.wid}_page_${entry.pageNumber}` : null;
+    return uid === selectedWordId;
+  });
+
+  const getWordId = (w: WordToken, li: number) =>
+    w.wid !== null ? `word_${w.wid}_page_${entry.pageNumber}` : `word_p${entry.pageNumber}_l${li}`;
+
+  const startEditing = (wordId: string, currentTxt: string) => {
+    setEditingWordId(wordId);
+    setEditValue(currentTxt);
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  const commitEdit = () => {
+    if (editingWordId) {
+      onWordEdit(editingWordId, editValue);
+      setEditingWordId(null);
+    }
+  };
+
+  const insertChar = (ch: string) => {
+    if (!editingWordId && selectedWordId) {
+      const w = allWords.find((w) => getWordId(w, 0) === selectedWordId);
+      const cur = wordEdits[selectedWordId] ?? w?.dataTxt ?? "";
+      startEditing(selectedWordId, cur + ch);
+      return;
+    }
+    if (editingWordId && inputRef.current) {
+      const pos = inputRef.current.selectionStart ?? editValue.length;
+      const newVal = editValue.slice(0, pos) + ch + editValue.slice(pos);
+      setEditValue(newVal);
+      setTimeout(() => { if (inputRef.current) { inputRef.current.setSelectionRange(pos + ch.length, pos + ch.length); } }, 0);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* Toolbar */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", padding: "8px 10px", background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8 }}>
+        <span style={SP.dim}>Align:</span>
+        {([["justify","⁞⁞","ممتد"],["center","⊟","وسط"],["flex-end","⊡","يمين"],["flex-start","⊞","يسار"]] as const).map(([v, icon, label]) => (
+          <button key={v} title={label} style={{ ...SP.btn, ...(pageAlign === v ? SP.btnOn : {}), padding: "2px 8px" }} onClick={() => onPageAlignChange(v)}>{icon}</button>
+        ))}
+        <div style={{ width: 1, height: 20, background: "#2a2f3e" }} />
+        <span style={SP.dim}>Font:</span>
+        <input type="number" min={10} max={80} value={fontSize} onChange={(e) => onFontSizeChange(parseInt(e.target.value) || 32)} style={{ ...SP.numInput, width: 52 }} />
+        <button style={{ ...SP.smallBtn, fontSize: 9 }} onClick={() => onApplyToAll("fontSize", fontSize)}>all</button>
+        <div style={{ width: 1, height: 20, background: "#2a2f3e" }} />
+        <span style={SP.dim}>Gap:</span>
+        <input type="number" min={-30} max={100} value={wordGap} onChange={(e) => onWordGapChange(parseInt(e.target.value) || 0)} style={{ ...SP.numInput, width: 52 }} />
+        <button style={{ ...SP.smallBtn, fontSize: 9 }} onClick={() => onApplyToAll("wordGap", wordGap)}>all</button>
+        <div style={{ width: 1, height: 20, background: "#2a2f3e" }} />
+        <span style={SP.dim}>Line:</span>
+        <input type="number" min={-20} max={60} value={lineGap} onChange={(e) => onLineGapChange(parseInt(e.target.value) || 0)} style={{ ...SP.numInput, width: 52 }} />
+        <button style={{ ...SP.smallBtn, fontSize: 9 }} onClick={() => onApplyToAll("lineGap", lineGap)}>all</button>
+        <div style={{ flex: 1 }} />
+        <button style={{ ...SP.btn, ...(showPalette ? SP.btnOn : {}) }} onClick={() => setShowPalette(!showPalette)}>🔤 Palette</button>
+        {selectedWordId && (
+          <button style={{ ...SP.btn, color: "#f87171" }} onClick={() => {
+            onWordEdit(selectedWordId, allWords.find((w) => getWordId(w, 0) === selectedWordId)?.dataTxt ?? "");
+            setSelectedWordId(null); setEditingWordId(null);
+          }}>↺ Reset word</button>
+        )}
+      </div>
+
+      {/* Selected word editor */}
+      {selectedWordId && (
+        <div style={{ background: "#0f1117", border: "1px solid #c9a96e44", borderRadius: 8, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <code style={{ fontSize: 10, color: "#7dd3fc", flex: 1 }}>{selectedWordId}</code>
+            {editingWordId !== selectedWordId && (
+              <button style={{ ...SP.btn, ...SP.btnGold }} onClick={() => {
+                const w = allWords.find((w) => getWordId(w, 0) === selectedWordId);
+                startEditing(selectedWordId, wordEdits[selectedWordId] ?? w?.dataTxt ?? "");
+              }}>✏️ Edit</button>
+            )}
+            <button style={SP.btn} onClick={() => { setSelectedWordId(null); setEditingWordId(null); }}>✕</button>
+          </div>
+          {editingWordId === selectedWordId ? (
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input
+                ref={inputRef}
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") setEditingWordId(null); }}
+                style={{ ...SP.numInput, flex: 1, fontSize: fontSize, fontFamily: "AALMAGHRIBI, serif", direction: "rtl", textAlign: "right", height: 42, padding: "6px 12px" }}
+                dir="rtl"
+              />
+              <button style={{ ...SP.btn, ...SP.btnGold }} onClick={commitEdit}>✅ Save</button>
+              <button style={SP.btn} onClick={() => setEditingWordId(null)}>✕</button>
+            </div>
+          ) : (
+            <div
+              style={{ background: "#0a0c10", border: "1px solid #2a2f3e", borderRadius: 6, padding: "8px 14px", fontSize: fontSize, fontFamily: "AALMAGHRIBI, serif", direction: "rtl", textAlign: "right", color: "#e8e6e0", cursor: "pointer" }}
+              onDoubleClick={() => {
+                const w = allWords.find((w) => getWordId(w, 0) === selectedWordId);
+                startEditing(selectedWordId, wordEdits[selectedWordId] ?? w?.dataTxt ?? "");
+              }}
+              title="Double-click to edit"
+            >
+              {wordEdits[selectedWordId] ?? allWords.find((w) => getWordId(w, 0) === selectedWordId)?.dataTxt ?? ""}
+            </div>
+          )}
+          <div style={{ fontSize: 9, color: "#4b5563", direction: "rtl" }}>انقر مرتين لتعديل الكلمة. اضغط Enter للحفظ، Escape للإلغاء.</div>
+        </div>
+      )}
+
+      {/* Arabic letter palette */}
+      {showPalette && <ArabicLetterPalette onInsert={insertChar} />}
+
+      {/* Page canvas */}
+      <div style={{ background: "#08090d", borderRadius: 8, padding: "16px 12px", border: "1px solid #1e2332", direction: "rtl", minHeight: 200 }}>
+        {entry.parsed.segments.map((seg) =>
+          seg.surahTitle ? (
+            <div key={seg.surahNumber} style={{ textAlign: "center", fontFamily: "AALMAGHRIBI, serif", fontSize: fontSize * 1.2, color: "#c9a96e", marginBottom: lineGap, padding: "4px 0" }}>
+              {seg.surahTitle}
+            </div>
+          ) : null
+        )}
+        {entry.parsed.lines.map((line, li) => (
+          <div
+            key={li}
+            style={{
+              display: "flex",
+              flexDirection: "row",
+              justifyContent: pageAlign === "justify" ? "space-between" : pageAlign,
+              gap: pageAlign === "justify" ? 0 : wordGap,
+              marginBottom: lineGap,
+              direction: "rtl",
+              flexWrap: "nowrap",
+            }}
+          >
+            {line.words.map((w) => {
+              const uid = getWordId(w, li);
+              const displayTxt = wordEdits[uid] ?? w.dataTxt;
+              const isSel      = uid === selectedWordId;
+              const isEditing  = uid === editingWordId;
+              const isEdited   = wordEdits[uid] !== undefined && wordEdits[uid] !== w.dataTxt;
+
+              return (
+                <span
+                  key={uid}
+                  id={uid}
+                  onClick={() => { if (!isEditing) { setSelectedWordId(isSel ? null : uid); if (isSel) setEditingWordId(null); } }}
+                  onDoubleClick={() => {
+                    setSelectedWordId(uid);
+                    startEditing(uid, wordEdits[uid] ?? w.dataTxt);
+                  }}
+                  title={`${w.dataTxt}${isEdited ? " [edited]" : ""}${w.hizbMark ? ` [${w.hizbMark.positionId}]` : ""}`}
+                  style={{
+                    fontFamily: "AALMAGHRIBI, serif",
+                    fontSize: fontSize,
+                    color: w.isAyahMarker ? "#c9a96e" : "#e8e6e0",
+                    cursor: "pointer",
+                    borderRadius: 3,
+                    padding: "1px 3px",
+                    outline: isSel ? "2px solid #c9a96e" : isEdited ? "1px dashed #10b981" : "none",
+                    background: isSel ? "#c9a96e15" : isEdited ? "#10b98108" : "transparent",
+                    userSelect: "none",
+                    position: "relative",
+                    transition: "all 0.1s",
+                    lineHeight: 1.4,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {w.hizbMark && (
+                    <sup style={{ fontSize: 8, color: "#c9a96e", verticalAlign: "super", marginLeft: 1 }}>{w.hizbMark.symbol}</sup>
+                  )}
+                  {displayTxt}
+                  {isEdited && <span style={{ position: "absolute", top: -3, right: -3, width: 5, height: 5, borderRadius: "50%", background: "#10b981" }} />}
+                </span>
+              );
+            })}
+          </div>
+        ))}
+        {entry.parsed.hizbMarks.length > 0 && (
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 8, justifyContent: "flex-end" }}>
+            {entry.parsed.hizbMarks.map((h, i) => (
+              <span key={i} style={{ background: "#c9a96e22", border: "1px solid #c9a96e44", color: "#c9a96e", borderRadius: 4, padding: "2px 7px", fontSize: 10, fontWeight: 700 }} title={h.positionId}>{h.symbol} {h.label}</span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Edit summary */}
+      {Object.keys(wordEdits).length > 0 && (
+        <div style={{ background: "#10b98108", border: "1px solid #10b98130", borderRadius: 7, padding: "8px 12px" }}>
+          <div style={{ fontSize: 10, color: "#10b981", fontWeight: 700, marginBottom: 5 }}>✏️ {Object.keys(wordEdits).length} كلمة معدّلة</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {Object.entries(wordEdits).map(([wid, txt]) => (
+              <span key={wid} style={{ background: "#10b98120", border: "1px solid #10b98140", color: "#10b981", borderRadius: 3, padding: "1px 6px", fontSize: 11, fontFamily: "AALMAGHRIBI, serif", direction: "rtl" }}>{txt}</span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TAFSIR & AUDIO PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+
+function TafsirAudioPanel({ activeEntry, onAnnotationSave, currentAnns, onCopyOverrideSave }: {
+  activeEntry: HistoryEntry; onAnnotationSave: (a: Annotation) => void;
+  currentAnns: Record<string, Annotation>; onCopyOverrideSave: (entryId: string, overrides: Record<string, string>) => void;
+}) {
+  const [tafsirSource, setTafsirSource] = useState(DEFAULT_TAFSIR);
+  const [warshReciter, setWarshReciter] = useState(DEFAULT_WARSH);
+  const [fetchedTafsirs, setFetchedTafsirs] = useState<Record<string, string>>({});
+  const [loadingTafsir, setLoadingTafsir]   = useState(false);
+  const [tafsirError,   setTafsirError]     = useState<string | null>(null);
+  const [playingKey,    setPlayingKey]       = useState<string | null>(null);
+  const [copyEdits,     setCopyEdits]        = useState<Record<string, string>>(activeEntry.copyOverrides ?? {});
+  const [singlePageText, setSinglePageText]  = useState("");
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => { setCopyEdits(activeEntry.copyOverrides ?? {}); }, [activeEntry.id]);
+
+  const ayahs = activeEntry.parsed.segments.flatMap((seg) =>
+    seg.ayahs.map((a) => ({
+      surahNumber: seg.surahNumber, aid: a.aid, ayahNum: a.ayahNum,
+      textData: a.words.filter((w) => !w.isAyahMarker).map((w) => w.dataTxt).join(" ")
+    }))
+  );
+
+  const fetchAllTafsir = async () => {
+    setLoadingTafsir(true); setTafsirError(null);
+    const tafsirId = TAFSIR_SOURCES[tafsirSource].id;
+    try {
+      const result: Record<string, string> = {};
+      const bySurah: Record<number, number[]> = {};
+      for (const a of ayahs) {
+        if (a.ayahNum <= 0) continue;
+        if (!bySurah[a.surahNumber]) bySurah[a.surahNumber] = [];
+        bySurah[a.surahNumber].push(a.ayahNum);
+      }
+      for (const [surahStr, ayahNums] of Object.entries(bySurah)) {
+        const surah = parseInt(surahStr);
+        const fetched = await fetchTafsirRange(surah, tafsirId, Math.min(...ayahNums), Math.max(...ayahNums));
+        for (const [ayahNum, text] of Object.entries(fetched)) result[`${surah}:${ayahNum}`] = text;
+      }
+      setFetchedTafsirs(result);
+    } catch (e: any) { setTafsirError(e.message); }
+    setLoadingTafsir(false);
+  };
+
+  const saveAllTafsirAsAnnotations = () => {
+    const srcName = TAFSIR_SOURCES[tafsirSource].name;
+    for (const [key, text] of Object.entries(fetchedTafsirs)) {
+      if (!text) continue;
+      const [surahStr, ayahStr] = key.split(":");
+      onAnnotationSave({ id: `api_tafsir_${key}_${tafsirSource}_${Date.now()}`, type: "tafsir", targetType: "ayah", targetKey: `ayah_${surahStr}_${ayahStr}`, title: srcName, body: text, source: `API — ${srcName}` });
+    }
+  };
+
+  const playAudio = (surah: number, ayah: number) => {
+    const key = `${surah}:${ayah}`;
+    if (audioElRef.current) { audioElRef.current.pause(); audioElRef.current.currentTime = 0; }
+    if (playingKey === key) { setPlayingKey(null); return; }
+    const audio = audioElRef.current ?? new Audio();
+    audio.src = warshAudioUrl(surah, ayah, warshReciter);
+    audio.onended = () => setPlayingKey(null);
+    audio.onerror = () => { setTafsirError("تعذّر تشغيل الصوت"); setPlayingKey(null); };
+    audioElRef.current = audio;
+    audio.play().then(() => setPlayingKey(key)).catch((err) => { setTafsirError(`خطأ: ${err.message}`); setPlayingKey(null); });
+  };
+
+  const applySinglePageText = () => {
+    if (!singlePageText.trim()) return;
+    const rawLines = singlePageText.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
+    const segs = activeEntry.parsed.segments;
+    const newEdits: Record<string, string> = {};
+    for (let lineIdx = 0; lineIdx < rawLines.length; lineIdx++) {
+      const surahNum = segs[Math.min(lineIdx, segs.length - 1)]?.surahNumber ?? segs[0]?.surahNumber ?? 1;
+      const parts = rawLines[lineIdx].replace(/\s+/g, " ").trim().split(/\s*\((\d+)\)\s*/);
+      for (let i = 0; i < parts.length; i += 2) {
+        const ayahText = parts[i].trim();
+        const markerNum = parts[i + 1] !== undefined ? parseInt(parts[i + 1]) : null;
+        if (markerNum !== null && ayahText) {
+          const key = `${surahNum}:${markerNum}`;
+          newEdits[key] = newEdits[key] ? `${newEdits[key]} ${ayahText}` : ayahText;
+        }
+      }
+    }
+    setCopyEdits((prev) => ({ ...prev, ...newEdits }));
+    onCopyOverrideSave(activeEntry.id, newEdits);
+    setSinglePageText("");
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "10px 12px" }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>📋 لصق نص copyData</div>
+        <textarea style={{ ...S.textarea, height: 80, direction: "rtl", fontFamily: "AALMAGHRIBI, serif", fontSize: 14 }}
+          value={singlePageText} onChange={(e) => setSinglePageText(e.target.value)}
+          placeholder="بِسۡمِ ٱللَّهِ... (1) ٱلۡحَمۡدُ... (2)" />
+        <button style={{ ...S.exportBtn, marginTop: 6 }} onClick={applySinglePageText} disabled={!singlePageText.trim()}>✅ تطبيق</button>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div><div style={{ fontSize: 10, color: "#6b7280", marginBottom: 4 }}>📖 Tafsir</div>
+          <select style={S.input} value={tafsirSource} onChange={(e) => setTafsirSource(e.target.value)}>
+            {Object.entries(TAFSIR_SOURCES).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+          </select></div>
+        <div><div style={{ fontSize: 10, color: "#6b7280", marginBottom: 4 }}>🎧 Warsh</div>
+          <select style={S.input} value={warshReciter} onChange={(e) => setWarshReciter(e.target.value)}>
+            {Object.entries(WARSH_RECITERS).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+          </select></div>
+        <button style={{ ...S.exportBtn, alignSelf: "flex-end" }} onClick={fetchAllTafsir} disabled={loadingTafsir}>
+          {loadingTafsir ? "⏳..." : "⬇️ Fetch Tafsir"}
+        </button>
+        {Object.keys(fetchedTafsirs).length > 0 && (
+          <button style={{ ...S.exportBtn, alignSelf: "flex-end", background: "linear-gradient(135deg,#10b981,#059669)" }} onClick={saveAllTafsirAsAnnotations}>💾 Save all</button>
+        )}
+      </div>
+      {tafsirError && <div style={{ ...S.errBanner, direction: "rtl" }}>❌ {tafsirError}</div>}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {ayahs.map((a) => {
+          const key        = `${a.surahNumber}:${a.ayahNum}`;
+          const tafsirText = fetchedTafsirs[key] ?? "";
+          const isPlaying  = playingKey === key;
+          const copyText   = copyEdits[key] ?? activeEntry.copyOverrides?.[key] ?? "";
+          const existingAnns = Object.values(currentAnns).filter((ann) => ann.targetKey === `ayah_${a.surahNumber}_${a.ayahNum}`);
+          return (
+            <div key={key} style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "10px 12px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                <span style={{ ...S.historyPageBadge, fontSize: 12 }}>{a.surahNumber}:{a.ayahNum > 0 ? a.ayahNum : "?"}</span>
+                <div style={{ flex: 1, fontSize: 14, color: "#e8e6e0", fontFamily: "AALMAGHRIBI, serif", direction: "rtl", lineHeight: 1.7 }}>{a.textData.slice(0, 120)}{a.textData.length > 120 ? "…" : ""}</div>
+                <button style={{ ...S.actBtn, background: isPlaying ? "#c9a96e22" : "#1e2332", color: isPlaying ? "#c9a96e" : "#9ca3af" }} onClick={() => playAudio(a.surahNumber, a.ayahNum)}>{isPlaying ? "⏸" : "▶"}</button>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginBottom: 3 }}>📋 copyData</div>
+                <textarea style={{ ...S.textarea, height: 52, direction: "rtl", fontFamily: "AALMAGHRIBI, serif", fontSize: 14 }}
+                  value={copyText} onChange={(e) => setCopyEdits((prev) => ({ ...prev, [key]: e.target.value }))}
+                  placeholder="الصق نص الآية هنا..." />
+                {copyEdits[key] !== undefined && copyEdits[key] !== (activeEntry.copyOverrides?.[key] ?? "") && (
+                  <div style={{ display: "flex", gap: 6, marginTop: 3 }}>
+                    <span style={{ fontSize: 9, color: "#c9a96e" }}>⚠️ Unsaved</span>
+                    <button style={{ ...S.actBtn, fontSize: 9, padding: "1px 6px", color: "#c9a96e" }} onClick={() => onCopyOverrideSave(activeEntry.id, { [key]: copyEdits[key] })}>💾 Save</button>
+                  </div>
+                )}
+              </div>
+              {tafsirText && (
+                <div style={{ marginTop: 6, background: "#0a0c10", border: "1px solid #10b98130", borderRadius: 6, padding: "8px 10px" }}>
+                  <div style={{ fontSize: 10, color: "#10b981", marginBottom: 4 }}>{TAFSIR_SOURCES[tafsirSource]?.name}</div>
+                  <div style={{ fontSize: 12, color: "#d1d5db", direction: "rtl", lineHeight: 2, fontFamily: "serif", maxHeight: 130, overflow: "auto" }}>{tafsirText.slice(0, 400)}{tafsirText.length > 400 ? "…" : ""}</div>
+                </div>
+              )}
+              {existingAnns.length > 0 && (
+                <div style={{ marginTop: 6, display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {existingAnns.map((ann) => (
+                    <span key={ann.id} style={{ fontSize: 9, background: "#10b98120", border: "1px solid #10b98140", color: "#10b981", borderRadius: 3, padding: "1px 5px" }}>📖 {ann.title}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BATCH IMPORT
+// ══════════════════════════════════════════════════════════════════════════════
+
+function RangeQuickFill({ items, onApply }: { items: ImportItem[]; onApply: (patches: Array<{ pageNumber: number; surahInput: string }>) => void }) {
+  const [rangeText, setRangeText] = useState("");
+  const [preview, setPreview]     = useState<Array<{ pageNumber: number; surahInput: string }>>([]);
+  const [error, setError]         = useState<string | null>(null);
+
+  const parseRanges = (text: string) => {
+    const result: Array<{ pageNumber: number; surahInput: string }> = [];
+    for (const token of text.trim().split(/[\s;\n\r]+/).filter(Boolean)) {
+      const match = token.match(/^(\d+)(?:-(\d+))?:(\d+(?:,\d+)*)$/);
+      if (!match) throw new Error(`تنسيق غير صحيح: "${token}"`);
+      const from = parseInt(match[1]); const to = match[2] ? parseInt(match[2]) : from;
+      if (from > to) throw new Error(`نطاق خاطئ: ${from}-${to}`);
+      if (to - from > 300) throw new Error("نطاق كبير جداً");
+      for (let p = from; p <= to; p++) result.push({ pageNumber: p, surahInput: match[3] });
+    }
+    return result;
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <textarea style={{ ...S.textarea, height: 70, direction: "ltr", fontFamily: "monospace", fontSize: 12 }}
+        value={rangeText} onChange={(e) => setRangeText(e.target.value)}
+        placeholder={"1:1  2-45:2  46:2,3  47-70:3  ..."} />
+      <div style={{ display: "flex", gap: 6 }}>
+        <button style={S.actBtn} onClick={() => { try { setPreview(parseRanges(rangeText)); setError(null); } catch (e: any) { setError(e.message); setPreview([]); } }} disabled={!rangeText.trim()}>👁️ Preview</button>
+        <button style={S.exportBtn} onClick={() => { try { onApply(parseRanges(rangeText)); setPreview([]); setError(null); } catch (e: any) { setError(e.message); } }} disabled={!rangeText.trim()}>✅ Apply</button>
+        {preview.length > 0 && <span style={{ fontSize: 10, color: "#4ade80", alignSelf: "center" }}>→ {preview.length} pages</span>}
+      </div>
+      {error && <div style={{ fontSize: 10, color: "#f87171" }}>❌ {error}</div>}
+    </div>
+  );
+}
+
+function BatchImportView({ onImportDone, hizbCursor, onHizbCursorUpdate }: {
+  onImportDone: (entries: HistoryEntry[], newHizbCursor: number) => void;
+  hizbCursor: number; onHizbCursorUpdate: (v: number) => void;
+}) {
+  const [items, setItems]           = useState<ImportItem[]>([]);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress]     = useState({ current: 0, total: 0 });
+  const [quranText, setQuranText]   = useState("");
+  const fileRef    = useRef<HTMLInputElement>(null);
+  const folderRef  = useRef<HTMLInputElement>(null);
+  const [manualSurahIds, setManualSurahIds] = useState<Set<string>>(new Set());
+
+  const addFiles = (files: FileList | null) => {
+    if (!files) return;
+    const newItems: ImportItem[] = [];
+    for (const file of Array.from(files)) {
+      if (!file.name.endsWith(".html") && !file.name.endsWith(".htm")) continue;
+      const id = `import_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const guessedPage = guessPageNumber(file.name);
+      newItems.push({ id, file, filename: file.name, pageNumber: guessedPage || items.length + newItems.length + 1, surahInput: "", html: "", status: "pending" });
+    }
+    newItems.forEach((item) => {
+      const reader = new FileReader();
+      reader.onload = (e) => setItems((prev) => prev.map((p) => p.id === item.id ? { ...p, html: e.target?.result as string ?? "" } : p));
+      reader.readAsText(item.file);
+    });
+    setItems((prev) => [...prev, ...newItems].sort((a, b) => a.pageNumber - b.pageNumber));
+  };
+
+  const updateItem = (id: string, patch: Partial<ImportItem>) => setItems((prev) => prev.map((it) => it.id === id ? { ...it, ...patch } : it));
+  const removeItem = (id: string) => setItems((prev) => prev.filter((it) => it.id !== id));
+  const updateSurahInput = (id: string, val: string) => {
+    setManualSurahIds((prev) => new Set([...prev, id]));
+    setItems((prev) => {
+      const idx = prev.findIndex((it) => it.id === id);
+      if (idx === -1) return prev;
+      return prev.map((it, i) => {
+        if (i === idx) return { ...it, surahInput: val };
+        if (i > idx && !manualSurahIds.has(it.id)) return { ...it, surahInput: val };
+        return it;
+      });
+    });
+  };
+
+  const buildCopyMap = (rawText: string, orderedItems: ImportItem[]): Record<string, string> => {
+    if (!rawText.trim()) return {};
+    const map: Record<string, string> = {};
+    const rawLines = rawText.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
+    const surahSequence: number[] = [];
+    for (const item of orderedItems) {
+      if (!item.surahInput) continue;
+      const nums = item.surahInput.split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n));
+      for (const n of nums) { if (!surahSequence.length || surahSequence[surahSequence.length - 1] !== n) surahSequence.push(n); }
+    }
+    for (let seqIdx = 0; seqIdx < surahSequence.length; seqIdx++) {
+      const surah   = surahSequence[seqIdx];
+      const lineIdx = surah - 1;
+      if (lineIdx >= rawLines.length) continue;
+      const parts = rawLines[lineIdx].replace(/\s+/g, " ").trim().split(/\s*\((\d+)\)\s*/);
+      for (let i = 0; i < parts.length; i += 2) {
+        const ayahText  = parts[i].trim();
+        const markerNum = parts[i + 1] !== undefined ? parseInt(parts[i + 1]) : null;
+        if (markerNum !== null && ayahText) {
+          const key = `${surah}:${markerNum}`;
+          map[key] = map[key] ? `${map[key]} ${ayahText}` : ayahText;
+        }
+      }
+    }
+    return map;
+  };
+
+  const processAll = async () => {
+    const ready = items.filter((it) => it.html && it.surahInput && it.pageNumber > 0);
+    if (ready.length === 0) return;
+    setIsProcessing(true);
+    setProgress({ current: 0, total: ready.length });
+    const globalCopyMap = buildCopyMap(quranText, ready);
+    const entries: HistoryEntry[] = [];
+    let cursor = hizbCursor;
+    for (let i = 0; i < ready.length; i++) {
+      const it = ready[i];
+      const surahNums = it.surahInput.split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n) && n >= 1 && n <= 114);
+      if (surahNums.length === 0) { updateItem(it.id, { status: "error", error: "No valid surah numbers" }); continue; }
+      updateItem(it.id, { status: "processing" });
+      try {
+        const { entry, hizbCursorOut } = await processOnePage(it.html, it.pageNumber, surahNums, cursor);
+        cursor = hizbCursorOut;
+        const copyOvr: Record<string, string> = {};
+        for (const seg of entry.parsed.segments) {
+          for (const a of seg.ayahs) {
+            if (a.ayahNum <= 0) continue;
+            const key = `${seg.surahNumber}:${a.ayahNum}`;
+            if (globalCopyMap[key]) copyOvr[key] = globalCopyMap[key];
+          }
+        }
+        entries.push({ ...entry, searchOverrides: {}, copyOverrides: copyOvr, wordEdits: {} });
+        updateItem(it.id, { status: "done" });
+      } catch (e: any) { updateItem(it.id, { status: "error", error: e.message }); }
+      setProgress((p) => ({ ...p, current: i + 1 }));
+    }
+    onHizbCursorUpdate(cursor);
+    onImportDone(entries, cursor);
+    setIsProcessing(false);
+  };
+
+  const statusColor: Record<ImportItem["status"], string> = { pending: "#6b7280", processing: "#c9a96e", done: "#4ade80", error: "#f87171" };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <button style={S.exportBtn} onClick={() => fileRef.current?.click()}>📄 Select Files</button>
+        <button style={S.exportBtn} onClick={() => folderRef.current?.click()}>📁 Select Folder</button>
+        <span style={{ fontSize: 11, color: "#6b7280" }}>{items.length} file(s)</span>
+        <div style={{ flex: 1 }} />
+        {items.length > 0 && !isProcessing && (
+          <button style={{ ...S.btn, background: "linear-gradient(135deg,#c9a96e,#a07840)", color: "#0f1117", fontWeight: 700, width: "auto", padding: "7px 16px" }}
+            onClick={processAll}>⚡ Process All ({items.filter((it) => it.html && it.surahInput && it.pageNumber > 0).length})</button>
+        )}
+      </div>
+      <input ref={fileRef} type="file" accept=".html,.htm" multiple style={{ display: "none" }} onChange={(e) => addFiles(e.target.files)} />
+      <input ref={folderRef} type="file" accept=".html,.htm" multiple style={{ display: "none" }}
+        // @ts-ignore
+        webkitdirectory="" onChange={(e) => addFiles(e.target.files)} />
+
+      {isProcessing && (
+        <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "10px 14px" }}>
+          <div style={{ fontSize: 12, color: "#c9a96e", marginBottom: 6 }}>Processing {progress.current + 1}/{progress.total}...</div>
+          <div style={S.pTrack}><div style={{ ...S.pFill, width: `${progress.total ? (progress.current / progress.total) * 100 : 0}%` }} /></div>
+        </div>
+      )}
+
+      {items.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "24px 1fr 80px 140px 80px 32px", gap: 6, padding: "4px 8px", fontSize: 10, color: "#4b5563", textTransform: "uppercase" }}>
+            <div /><div>File</div><div>Page #</div><div>Surah(s)</div><div>Status</div><div />
+          </div>
+          {items.map((it) => (
+            <div key={it.id} draggable
+              onDragStart={() => setDraggingId(it.id)}
+              onDragOver={(e) => { e.preventDefault(); setDragOverId(it.id); }}
+              onDrop={() => { if (!draggingId || draggingId === it.id) return; setItems((prev) => { const arr = [...prev]; const fi = arr.findIndex((x) => x.id === draggingId); const ti = arr.findIndex((x) => x.id === it.id); const [m] = arr.splice(fi, 1); arr.splice(ti, 0, m); return arr; }); setDraggingId(null); setDragOverId(null); }}
+              style={{ display: "grid", gridTemplateColumns: "24px 1fr 80px 140px 80px 32px", gap: 6, alignItems: "center", background: dragOverId === it.id ? "#c9a96e10" : "#0f1117", border: `1px solid ${dragOverId === it.id ? "#c9a96e44" : "#1e2332"}`, borderRadius: 7, padding: "6px 8px", cursor: "grab" }}>
+              <div style={{ fontSize: 14, color: "#4b5563", textAlign: "center" }}>⠿</div>
+              <div style={{ fontSize: 11, color: "#e8e6e0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={it.filename}>{it.filename}</div>
+              <input type="number" min={1} value={it.pageNumber} onChange={(e) => updateItem(it.id, { pageNumber: parseInt(e.target.value) || 0 })} style={{ ...S.input, padding: "3px 6px", fontSize: 12, textAlign: "center" }} />
+              <input type="text" value={it.surahInput} placeholder="e.g. 2 or 2,3" onChange={(e) => updateSurahInput(it.id, e.target.value)} style={{ ...S.input, padding: "3px 6px", fontSize: 12 }} />
+              <div style={{ fontSize: 10, fontWeight: 700, color: statusColor[it.status] }}>{it.status === "error" ? `❌ ${it.error?.slice(0, 20)}` : it.status.toUpperCase()}</div>
+              <button style={{ ...S.miniBtn, color: "#f87171" }} onClick={() => removeItem(it.id)}>✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>⚡ Surah Range Quick-Fill</div>
+        <RangeQuickFill items={items} onApply={(patches) => setItems((prev) => prev.map((it) => {
+          const p = patches.find((px) => px.pageNumber === it.pageNumber);
+          if (p) { setManualSurahIds((ms) => new Set([...ms, it.id])); return { ...it, surahInput: p.surahInput }; }
+          return it;
+        }))} />
+      </div>
+
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={S.cardTitle}>📋 نص القرآن لـ copyData</div>
+          <label style={{ ...S.exportBtn, cursor: "pointer", fontSize: 10 }}>
+            📄 .txt
+            <input type="file" accept=".txt" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; if (!f) return; const r = new FileReader(); r.onload = (ev) => setQuranText(ev.target?.result as string ?? ""); r.readAsText(f, "utf-8"); e.target.value = ""; }} />
+          </label>
+        </div>
+        <textarea style={{ ...S.textarea, height: 120, direction: "rtl", fontFamily: "AALMAGHRIBI, serif", fontSize: 14 }}
+          value={quranText} onChange={(e) => setQuranText(e.target.value)}
+          placeholder="بِسۡمِ ٱللَّهِ... (1) ٱلۡحَمۡدُ... (2)..." />
+        {quranText.trim() && (() => { const count = (quranText.match(/\(\d+\)/g) ?? []).length; return <div style={{ fontSize: 10, color: count > 0 ? "#4ade80" : "#f87171", marginTop: 4 }}>{count > 0 ? `✅ ${count} آية` : "⚠️ لا أرقام آيات"}</div>; })()}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HISTORY PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+
+function HistoryPanel({ history, selectedId, onSelect, onRemove, onRename, onExportManager }: {
+  history: HistoryEntry[]; selectedId: string | null;
+  onSelect: (e: HistoryEntry) => void; onRemove: (id: string) => void;
+  onRename: (id: string, label: string) => void; onExportManager: () => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editVal,   setEditVal]   = useState("");
+  const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={S.cardTitle}>📚 History ({history.length} pages)</div>
+        <button style={S.exportBtn} onClick={onExportManager} disabled={history.length === 0}>📦 MushafManager.tsx</button>
+      </div>
+      {history.length === 0 && <div style={{ color: "#4b5563", textAlign: "center", padding: "30px 0", fontSize: 12 }}>No pages yet.</div>}
+      {sorted.map((e) => (
+        <div key={e.id} style={{ ...S.historyItem, ...(selectedId === e.id ? S.historyItemSel : {}) }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+            <div style={S.historyPageBadge}>P{e.pageNumber}</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {editingId === e.id ? (
+                <input style={{ ...S.input, padding: "2px 6px", fontSize: 12 }} value={editVal} autoFocus
+                  onChange={(ev) => setEditVal(ev.target.value)}
+                  onBlur={() => { onRename(e.id, editVal); setEditingId(null); }}
+                  onKeyDown={(ev) => { if (ev.key === "Enter") { onRename(e.id, editVal); setEditingId(null); } if (ev.key === "Escape") setEditingId(null); }} />
+              ) : (
+                <div style={{ fontSize: 12, color: "#e8e6e0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "text" }} onDoubleClick={() => { setEditingId(e.id); setEditVal(e.label); }}>{e.label}</div>
+              )}
+              <div style={{ fontSize: 10, color: "#4b5563", marginTop: 2 }}>
+                Surah {e.surahNumbers.join(",")} · {e.parsed.lines.length} lines
+                {Object.keys(e.wordEdits ?? {}).length > 0 && <span style={{ color: "#10b981", marginLeft: 4 }}>{Object.keys(e.wordEdits).length} edits</span>}
+                {e.parsed.hasSajda && <span style={{ color: "#4ade80", marginLeft: 4 }}>◆سجدة</span>}
+                {e.parsed.hizbMarks.map((h, i) => <span key={i} style={{ color: "#c9a96e", marginLeft: 4 }}>{h.symbol}</span>)}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 4 }}>
+            <button style={S.miniBtn} onClick={() => onSelect(e)}>👁️</button>
+            <button style={S.miniBtn} onClick={() => { setEditingId(e.id); setEditVal(e.label); }}>✏️</button>
+            <button style={{ ...S.miniBtn, color: "#f87171" }} onClick={() => onRemove(e.id)}>🗑️</button>
+          </div>
+        </div>
+      ))}
+      {history.length > 0 && (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ fontSize: 10, color: "#4b5563", marginBottom: 5 }}>Surah coverage</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+            {Array.from(new Set(history.flatMap((e) => e.surahNumbers))).sort((a, b) => a - b).map((sn) => (
+              <span key={sn} style={{ background: "#c9a96e22", border: "1px solid #c9a96e44", color: "#c9a96e", borderRadius: 4, padding: "2px 6px", fontSize: 10 }}>{sn}</span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HAFS / WARSH MAPPING PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+
+const SURAH_AYAH_COUNTS: Record<number, number> = {
+  1:7,2:286,3:200,4:176,5:120,6:165,7:206,8:75,9:129,10:109,
+  11:123,12:111,13:43,14:52,15:99,16:128,17:111,18:110,19:98,20:135,
+  21:112,22:78,23:118,24:64,25:77,26:227,27:93,28:88,29:69,30:60,
+  31:34,32:30,33:73,34:54,35:45,36:83,37:182,38:88,39:75,40:85,
+  41:54,42:53,43:89,44:59,45:37,46:35,47:38,48:29,49:18,50:45,
+  51:60,52:49,53:62,54:55,55:78,56:96,57:29,58:22,59:24,60:13,
+  61:14,62:11,63:11,64:18,65:12,66:12,67:30,68:52,69:52,70:44,
+  71:28,72:28,73:20,74:56,75:40,76:31,77:50,78:40,79:46,80:42,
+  81:29,82:19,83:36,84:25,85:22,86:17,87:19,88:26,89:30,90:20,
+  91:15,92:21,93:11,94:8,95:8,96:19,97:5,98:8,99:8,100:11,
+  101:11,102:8,103:3,104:9,105:5,106:4,107:7,108:3,109:6,110:3,
+  111:5,112:4,113:5,114:6,
+};
+
+function HafsWarshMappingPanel({ history, hafsWarshMap, onMapChange }: {
+  history: HistoryEntry[]; hafsWarshMap: HafsWarshMap; onMapChange: (map: HafsWarshMap) => void;
+}) {
+  const [jsonText, setJsonText]   = useState(() => JSON.stringify(hafsWarshMap, null, 2));
+  const [jsonError, setJsonError] = useState<string | null>(null);
+  const [jsonDirty, setJsonDirty] = useState(false);
+  const [fetchingTafsir, setFetchingTafsir] = useState(false);
+  const [offlineTafsir,  setOfflineTafsir]  = useState<Record<string, string>>({});
+  const [tafsirSrc,      setTafsirSrc]      = useState("ibn_kathir");
+  const [fetchProg,      setFetchProg]       = useState({ done: 0, total: 0 });
+  const [fetchErr,       setFetchErr]        = useState<string | null>(null);
+
+  const allSurahs = [...new Set(history.flatMap(e => e.surahNumbers))].sort((a, b) => a - b);
+
+  useEffect(() => { if (!jsonDirty) setJsonText(JSON.stringify(hafsWarshMap, null, 2)); }, [hafsWarshMap]);
+
+  const applyJson = () => {
+    try {
+      const parsed = JSON.parse(jsonText);
+      const normalized: HafsWarshMap = {};
+      for (const [sk, sv] of Object.entries(parsed)) {
+        if (isNaN(parseInt(sk))) throw new Error(`مفتاح سورة غير صحيح: "${sk}"`);
+        normalized[sk] = {};
+        for (const [hk, wl] of Object.entries(sv as Record<string, unknown>)) {
+          if (!Array.isArray(wl)) throw new Error(`يجب أن تكون مصفوفة: ${sk}:${hk}`);
+          normalized[sk][hk] = (wl as (string|number)[]).map(String);
+        }
+      }
+      onMapChange(normalized);
+      setJsonText(JSON.stringify(normalized, null, 2));
+      setJsonError(null); setJsonDirty(false);
+    } catch (e: any) { setJsonError(e.message); }
+  };
+
+  const addSurahMapping = (surahNum: number, ayahCount: number) => {
+    const surahEntry: Record<string, string[]> = {};
+    for (let i = 1; i <= ayahCount; i++) surahEntry[String(i)] = [String(i)];
+    const next = { ...hafsWarshMap, [String(surahNum)]: surahEntry };
+    onMapChange(next); setJsonText(JSON.stringify(next, null, 2)); setJsonDirty(false);
+  };
+
+  const fetchAllOfflineTafsir = async () => {
+    setFetchingTafsir(true); setFetchErr(null);
+    const result: Record<string, string> = { ...offlineTafsir };
+    const tafsirId = TAFSIR_SOURCES[tafsirSrc]?.id ?? 4;
+    const toFetch: Array<{ surah: number; warshAyah: number; hafsAyah: number }> = [];
+    for (const entry of history) {
+      for (const seg of entry.parsed.segments) {
+        for (const a of seg.ayahs) {
+          if (a.ayahNum <= 0) continue;
+          const warshKey = `${seg.surahNumber}:${a.ayahNum}`;
+          if (!result[warshKey]) {
+            const hafsAyah = warshToHafs(hafsWarshMap, seg.surahNumber, a.ayahNum);
+            toFetch.push({ surah: seg.surahNumber, warshAyah: a.ayahNum, hafsAyah });
+          }
+        }
+      }
+    }
+    const unique = toFetch.filter((item, i, arr) => arr.findIndex(x => x.surah === item.surah && x.warshAyah === item.warshAyah) === i);
+    setFetchProg({ done: 0, total: unique.length });
+    const bySurah: Record<number, { warsh: number; hafs: number }[]> = {};
+    for (const item of unique) { if (!bySurah[item.surah]) bySurah[item.surah] = []; bySurah[item.surah].push({ warsh: item.warshAyah, hafs: item.hafsAyah }); }
+    let done = 0;
+    for (const [surahStr, pairs] of Object.entries(bySurah)) {
+      const surah  = parseInt(surahStr);
+      const sorted = [...pairs].sort((a, b) => a.hafs - b.hafs);
+      try {
+        const fetched = await fetchTafsirRange(surah, tafsirId, sorted[0].hafs, sorted[sorted.length - 1].hafs);
+        for (const pair of sorted) { const text = fetched[pair.hafs]; if (text) result[`${surah}:${pair.warsh}`] = text; done++; }
+        setFetchProg({ done, total: unique.length });
+        await new Promise<void>(r => setTimeout(r, 100));
+      } catch (e: any) { setFetchErr(`Surah ${surah}: ${e.message}`); }
+    }
+    setOfflineTafsir(result); setFetchingTafsir(false);
+  };
+
+  const exportOfflineTafsir = () => {
+    const blob = new Blob([JSON.stringify({ _version: 1, _date: new Date().toISOString(), tafsirSource: tafsirSrc, hafsWarshMap, tafsirs: offlineTafsir }, null, 2)], { type: "application/json" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `tafsir-offline-${tafsirSrc}.json`; a.click();
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>🗺️ Hafs ↔ Warsh Mapping</div>
+        <div style={{ fontSize: 11, color: "#9ca3af", direction: "rtl", lineHeight: 2 }}>
+          <code style={S.ic}>{"{ surah: { hafsAyah: [warshAyah, ...] } }"}</code> — تركها فارغة = نفس الترقيم.
+        </div>
+      </div>
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase" }}>📝 JSON Editor</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {jsonDirty && <span style={{ fontSize: 9, color: "#f59e0b", alignSelf: "center" }}>⚠️ unsaved</span>}
+            <button style={{ ...S.exportBtn, fontSize: 10 }} onClick={applyJson}>✅ Apply</button>
+            <button style={{ ...S.actBtn, fontSize: 10 }} onClick={() => { setJsonText("{}"); setJsonDirty(true); }}>↺ Clear</button>
+          </div>
+        </div>
+        <textarea style={{ ...S.textarea, height: 220, direction: "ltr", fontFamily: "monospace", fontSize: 12 }}
+          value={jsonText} onChange={(e) => { setJsonText(e.target.value); setJsonDirty(true); }} spellCheck={false} />
+        {jsonError && <div style={{ fontSize: 10, color: "#f87171", marginTop: 4 }}>❌ {jsonError}</div>}
+      </div>
+      {allSurahs.length > 0 && (
+        <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px" }}>
+          <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>⚡ Quick-add 1-to-1</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {allSurahs.map((sn) => {
+              const hasMapping = !!hafsWarshMap[String(sn)];
+              return (
+                <button key={sn} style={{ ...S.miniBtn, background: hasMapping ? "#10b98120" : "#1e2332", border: `1px solid ${hasMapping ? "#10b98144" : "#2a2f3e"}`, color: hasMapping ? "#10b981" : "#9ca3af" }}
+                  onClick={() => addSurahMapping(sn, SURAH_AYAH_COUNTS[sn] ?? 0)} title={`سورة ${sn}`}>
+                  {sn} {hasMapping ? "✓" : "+"}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <div style={{ background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ fontSize: 10, color: "#c9a96e", fontWeight: 700, textTransform: "uppercase" }}>📖 Offline Tafsir Fetch</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <select style={{ ...S.input, width: "auto" }} value={tafsirSrc} onChange={(e) => setTafsirSrc(e.target.value)}>
+            {Object.entries(TAFSIR_SOURCES).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+          </select>
+          <button style={S.exportBtn} onClick={fetchAllOfflineTafsir} disabled={fetchingTafsir || history.length === 0}>
+            {fetchingTafsir ? `⏳ ${fetchProg.done}/${fetchProg.total}...` : "⬇️ Fetch All"}
+          </button>
+          {Object.keys(offlineTafsir).length > 0 && (
+            <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#10b981,#059669)" }} onClick={exportOfflineTafsir}>💾 Export ({Object.keys(offlineTafsir).length})</button>
+          )}
+        </div>
+        {fetchingTafsir && <div style={S.pTrack}><div style={{ ...S.pFill, width: `${fetchProg.total ? (fetchProg.done/fetchProg.total)*100 : 0}%` }} /></div>}
+        {fetchErr && <div style={{ fontSize: 10, color: "#f87171" }}>⚠️ {fetchErr}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ══════════════════════════════════════════════════════════════════════════════
+
+export default function QuranProcessor() {
+  const [ready,       setReady]       = useState(false);
+  const [history,     setHistory]     = useState<HistoryEntry[]>([]);
+  const [allColors,   setAllColors]   = useState<Record<string, Record<string, string>>>({});
+  const [annotations, setAnnotations] = useState<AnnotationStore>({});
+  const [hizbCursor,  setHizbCursor]  = useState(0);
+  const [hafsWarshMap, setHafsWarshMap] = useState<HafsWarshMap>({});
+  const [backupError,  setBackupError]  = useState<string | null>(null);
+  const [backupProg,   setBackupProg]   = useState<{done:number;total:number}|null>(null);
+  const backupFileRef = useRef<HTMLInputElement>(null);
+
+  const [html,       setHtml]       = useState("");
+  const [pageNumber, setPageNumber] = useState(1);
+  const [surahInput, setSurahInput] = useState("1");
+  const [step,       setStep]       = useState<Step>("idle");
+  const [error,      setError]      = useState<string | null>(null);
+  const [isDragging, setDrag]       = useState(false);
+  const fileRef2 = useRef<HTMLInputElement>(null);
+
+  const [activeEntry, setActiveEntry] = useState<HistoryEntry | null>(null);
+  const [outputTab,   setOutputTab]   = useState<"tsx" | "summary" | "preview" | "apis">("tsx");
+  const [view,        setView]        = useState<MainView>("processor");
+  const [copied,      setCopied]      = useState(false);
+
+  const currentAnns: Record<string, Annotation> = activeEntry ? (annotations[activeEntry.id] ?? {}) : {};
+
+  const currentSettings = (): Settings => ({
+    allColors, annotations, hizbCursor, lastPageNumber: pageNumber, hafsWarshMap,
+  });
+
+  useEffect(() => {
+    const s = loadSettings();
+    setAllColors(s.allColors);
+    setAnnotations(s.annotations);
+    setHizbCursor(s.hizbCursor);
+    setHafsWarshMap(s.hafsWarshMap ?? {});
+    setPageNumber(s.lastPageNumber || 1);
+    idbGetAll().then((pages) => {
+      setHistory(pages.sort((a, b) => a.pageNumber - b.pageNumber));
+      setReady(true);
+    }).catch(() => setReady(true));
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    saveSettings({ allColors, annotations, hizbCursor, lastPageNumber: pageNumber, hafsWarshMap });
+  });
+
+  // Word edits — stored in entry.wordEdits
+  const handleWordEdit = useCallback((wordId: string, newTxt: string) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, wordEdits: { ...(activeEntry.wordEdits ?? {}), [wordId]: newTxt } };
+    // Regenerate TSX
+    updated.tsx = generateTsx(updated.parsed, updated.searchOverrides, updated.copyOverrides ?? {}, updated.wordEdits, annotations[updated.id] ?? {}, updated.pageAlign ?? "justify", updated.wordGap ?? 55, updated.fontSize ?? 32, updated.lineGap ?? 8);
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === updated.id ? updated : e));
+    idbPut(updated).catch(console.error);
+  }, [activeEntry, annotations]);
+
+  const handleAnnSave = useCallback((a: Annotation) => {
+    if (!activeEntry) return;
+    setAnnotations((prev) => ({ ...prev, [activeEntry.id]: { ...(prev[activeEntry.id] ?? {}), [a.id]: a } }));
+  }, [activeEntry]);
+
+  const handleAnnDelete = useCallback((annId: string) => {
+    if (!activeEntry) return;
+    setAnnotations((prev) => { const ex = { ...(prev[activeEntry.id] ?? {}) }; delete ex[annId]; return { ...prev, [activeEntry.id]: ex }; });
+  }, [activeEntry]);
+
+  const handlePageAlignChange = useCallback((align: HistoryEntry["pageAlign"]) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, pageAlign: align };
+    updated.tsx = generateTsx(updated.parsed, updated.searchOverrides, updated.copyOverrides ?? {}, updated.wordEdits ?? {}, annotations[updated.id] ?? {}, align, updated.wordGap ?? 55, updated.fontSize ?? 32, updated.lineGap ?? 8);
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === updated.id ? updated : e));
+    idbPut(updated).catch(console.error);
+  }, [activeEntry, annotations]);
+
+  const handleWordGapChange = useCallback((gap: number) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, wordGap: gap };
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === updated.id ? updated : e));
+  }, [activeEntry]);
+
+  const handleFontSizeChange = useCallback((size: number) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, fontSize: size };
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === updated.id ? updated : e));
+  }, [activeEntry]);
+
+  const handleLineGapChange = useCallback((gap: number) => {
+    if (!activeEntry) return;
+    const updated = { ...activeEntry, lineGap: gap };
+    setActiveEntry(updated);
+    setHistory((prev) => prev.map((e) => e.id === updated.id ? updated : e));
+  }, [activeEntry]);
+
+  const handleApplyToAll = useCallback((field: "wordGap" | "fontSize" | "lineGap", value: number) => {
+    setHistory((prev) => {
+      const next = prev.map((e) => ({ ...e, [field]: value }));
+      idbPutMany(next).catch(console.error);
+      return next;
+    });
+    if (activeEntry) setActiveEntry((prev) => prev ? { ...prev, [field]: value } : prev);
+  }, [activeEntry]);
+
+  const handleCopyOverrideSave = useCallback((entryId: string, overrides: Record<string, string>) => {
+    setHistory((prev) => {
+      const next = prev.map((e) => e.id === entryId ? { ...e, copyOverrides: { ...(e.copyOverrides ?? {}), ...overrides } } : e);
+      const updated = next.find((e) => e.id === entryId);
+      if (updated) idbPut(updated).catch(console.error);
+      return next;
+    });
+    if (activeEntry?.id === entryId) {
+      setActiveEntry((prev) => prev ? { ...prev, copyOverrides: { ...(prev.copyOverrides ?? {}), ...overrides } } : prev);
+    }
+  }, [activeEntry]);
+
+  const looksEscaped = html.includes('\\"') || /\\n/.test(html);
+  const surahNumbers = surahInput.split(",").map((s) => parseInt(s.trim())).filter((n) => !isNaN(n) && n >= 1 && n <= 114);
+
+  const process = useCallback(async () => {
+    if (!html.trim() || surahNumbers.length === 0) return;
+    setError(null); setStep("parsing");
+    try {
+      const { entry, hizbCursorOut } = await processOnePage(html, pageNumber, surahNumbers, hizbCursor);
+      setHizbCursor(hizbCursorOut);
+      const full: HistoryEntry = { ...entry, searchOverrides: {}, copyOverrides: {}, wordEdits: {} };
+      idbPut(full).catch(console.error);
+      setHistory((prev) => { const i = prev.findIndex((e) => e.pageNumber === pageNumber); if (i !== -1) { const n = [...prev]; n[i] = full; return n; } return [...prev, full]; });
+      setActiveEntry(full);
+      setOutputTab("tsx");
+      setStep("done");
+      setPageNumber((p) => p + 1);
+      setHtml("");
+    } catch (e: any) { setError(e.message ?? "Error"); setStep("error"); }
+  }, [html, pageNumber, surahNumbers, hizbCursor]);
+
+  const handleBatchDone = (entries: HistoryEntry[], newCursor: number) => {
+    setHizbCursor(newCursor);
+    idbPutMany(entries).catch(console.error);
+    setHistory((prev) => {
+      let next = [...prev];
+      for (const e of entries) { const i = next.findIndex((x) => x.pageNumber === e.pageNumber); if (i !== -1) next[i] = e; else next.push(e); }
+      return next.sort((a, b) => a.pageNumber - b.pageNumber);
+    });
+    if (entries.length > 0) { setActiveEntry(entries[entries.length - 1]); setView("history"); }
+  };
+
+  const getTsx = (e: HistoryEntry) => generateTsx(e.parsed, e.searchOverrides, e.copyOverrides ?? {}, e.wordEdits ?? {}, annotations[e.id] ?? {}, e.pageAlign ?? "justify", e.wordGap ?? 55, e.fontSize ?? 32, e.lineGap ?? 8);
+
+  const copy     = () => { if (!activeEntry) return; navigator.clipboard.writeText(getTsx(activeEntry)).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); }); };
+  const download = () => { if (!activeEntry) return; dl(getTsx(activeEntry), `page${activeEntry.pageNumber}.tsx`); };
+  const exportManager = () => { if (history.length === 0) return; dl(generateMushafManager(history), "MushafManager.tsx"); };
+  const removeEntry   = (id: string) => { idbDelete(id).catch(console.error); setHistory((prev) => prev.filter((e) => e.id !== id)); if (activeEntry?.id === id) setActiveEntry(null); };
+  const renameEntry   = (id: string, label: string) => {
+    setHistory((prev) => { const next = prev.map((e) => e.id === id ? { ...e, label } : e); const u = next.find((e) => e.id === id); if (u) idbPut(u).catch(console.error); return next; });
+    setActiveEntry((prev) => prev?.id === id ? { ...prev!, label } : prev);
+  };
+  const clearAll = () => {
+    if (!confirm("مسح كل شيء؟ لا يمكن التراجع.")) return;
+    idbClear().catch(console.error);
+    setHistory([]); setAllColors({}); setAnnotations({}); setHizbCursor(0); setActiveEntry(null); setHafsWarshMap({});
+    localStorage.removeItem(SETTINGS_KEY);
+  };
+
+  const isRunning  = step === "parsing";
+  const canProcess = !!html.trim() && surahNumbers.length > 0 && !isRunning;
+  const hizbPct    = Math.min((hizbCursor / 60) * 100, 100);
+
+  if (!ready) return (
+    <div style={{ minHeight: "100vh", background: "#0f1117", display: "flex", alignItems: "center", justifyContent: "center", color: "#c9a96e", fontSize: 18, fontFamily: "AALMAGHRIBI, serif" }}>
+      ﷽ جارٍ التحميل...
+    </div>
+  );
+
+  return (
+    <div style={S.root}>
+      {/* HEADER */}
+      <header style={S.header}>
+        <div style={S.hInner}>
+          <div style={S.logo}>
+            <span style={S.logoAr}>﷽</span>
+            <div><div style={S.logoTitle}>Quran Processor</div><div style={S.logoSub}>Text Edition — AALMAGHRIBI Font</div></div>
+          </div>
+          <div style={{ flex: 1, maxWidth: 280, padding: "0 16px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#6b7280", marginBottom: 3 }}>
+              <span>Hizb</span><span style={{ color: "#c9a96e" }}>{hizbCursor.toFixed(2)} / 60</span>
+            </div>
+            <div style={{ height: 5, background: "#1e2332", borderRadius: 4, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${hizbPct}%`, background: "linear-gradient(90deg,#c9a96e,#a07840)", borderRadius: 4 }} />
+            </div>
+            <div style={{ fontSize: 9, color: "#4b5563", marginTop: 2 }}>{history.length} pages processed</div>
+          </div>
+          <nav style={S.nav}>
+            {([["processor","⚙️ Process"],["import","📦 Import"],["history","📚 History"],["previewer","🔍 Preview"],["manager","📋 Manager"],["mapping","🗺️ Mapping"]] as [MainView,string][]).map(([v,l]) => (
+              <button key={v} style={{ ...S.navBtn, ...(view === v ? S.navBtnOn : {}) }} onClick={() => setView(v)}>
+                {l}{v === "history" && history.length > 0 ? <span style={S.navBadge}>{history.length}</span> : null}
+              </button>
+            ))}
+          </nav>
+        </div>
+      </header>
+
+      {/* PROCESSOR */}
+      {view === "processor" && (
+        <main style={S.main}>
+          <aside style={S.left}>
+            <section style={S.card}>
+              <div style={S.cardTitle}>⚙️ Config</div>
+              <Field label="Page Number"><input style={S.input} type="number" min={1} value={pageNumber} onChange={(e) => setPageNumber(parseInt(e.target.value) || 1)} /></Field>
+              <Field label="Surah(s) — comma separated">
+                <input style={S.input} value={surahInput} onChange={(e) => setSurahInput(e.target.value)} placeholder="1  or  2,3  or  18" />
+                {surahNumbers.length > 1 && <div style={{ fontSize: 10, color: "#c9a96e", marginTop: 2 }}>Multi: {surahNumbers.join(" + ")}</div>}
+              </Field>
+            </section>
+
+            <section style={S.card}>
+              <div style={S.cardTitle}>📿 Hizb</div>
+              <div style={{ fontSize: 11, color: "#9ca3af" }}>Position: <span style={{ color: "#c9a96e" }}>{hizbCursor.toFixed(3)}</span></div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 6 }}>
+                {[...history].sort((a, b) => a.pageNumber - b.pageNumber).flatMap((e) => e.parsed.hizbMarks).map((h, i) => (
+                  <span key={i} style={{ background: "#c9a96e22", border: "1px solid #c9a96e33", color: "#c9a96e", borderRadius: 3, padding: "1px 5px", fontSize: 9 }} title={h.positionId}>{h.symbol}</span>
+                ))}
+              </div>
+              <button style={{ ...S.toggle, marginTop: 8, fontSize: 10 }} onClick={() => { if (confirm("Reset hizb to 0?")) setHizbCursor(0); }}>↺ Reset hizb</button>
+            </section>
+
+            {history.length > 0 && (
+              <section style={S.card}>
+                <div style={S.cardTitle}>🕐 Recent</div>
+                {[...history].sort((a, b) => b.savedAt - a.savedAt).slice(0, 5).map((e) => (
+                  <div key={e.id} style={{ ...S.recentItem, ...(activeEntry?.id === e.id ? S.recentItemOn : {}) }} onClick={() => { setActiveEntry(e); setOutputTab("tsx"); }}>
+                    <span style={S.historyPageBadge}>P{e.pageNumber}</span>
+                    <span style={{ fontSize: 11, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.label}</span>
+                  </div>
+                ))}
+              </section>
+            )}
+
+            <section style={S.card}>
+              <div style={S.cardTitle}>💾 Backup</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                <button style={{ ...S.exportBtn, width: "100%", opacity: backupProg ? 0.6 : 1 }} disabled={!!backupProg}
+                  onClick={async () => {
+                    setBackupProg({ done: 0, total: history.length });
+                    try { await exportBackup(history, currentSettings(), (done, total) => setBackupProg({ done, total })); }
+                    catch (e: any) { setBackupError(e.message); }
+                    setBackupProg(null);
+                  }}>
+                  {backupProg ? `⏳ ${backupProg.done}/${backupProg.total}...` : `⬇️ Export backup (${history.length})`}
+                </button>
+                <button style={{ ...S.toggle, width: "100%", fontSize: 11 }} onClick={() => backupFileRef.current?.click()}>⬆️ Import backup</button>
+                <input ref={backupFileRef} type="file" accept=".json" style={{ display: "none" }} multiple
+                  onChange={async (e) => {
+                    const files = Array.from(e.target.files ?? []);
+                    if (!files.length) return;
+                    try {
+                      setBackupProg({ done: 0, total: files.length });
+                      let allPages: HistoryEntry[] = [];
+                      let mergedSettings: Settings | null = null;
+                      const sorted = files.sort((a, b) => { const na = parseInt(a.name.match(/part(\d+)of/)?.[1] ?? "1"); const nb = parseInt(b.name.match(/part(\d+)of/)?.[1] ?? "1"); return na - nb; });
+                      for (let fi = 0; fi < sorted.length; fi++) {
+                        const { pages, settings, isChunk } = await importBackup(sorted[fi]);
+                        allPages = [...allPages, ...pages];
+                        if (settings && (!mergedSettings || !isChunk)) mergedSettings = settings;
+                        setBackupProg({ done: fi + 1, total: sorted.length });
+                      }
+                      if (!mergedSettings) mergedSettings = defaultSettings();
+                      // Ensure all entries have wordEdits field
+                      const normalized = allPages.map((p) => ({ ...p, wordEdits: p.wordEdits ?? {} }));
+                      await idbPutMany(normalized);
+                      setHistory(normalized.sort((a, b) => a.pageNumber - b.pageNumber));
+                      setAllColors(mergedSettings.allColors);
+                      setAnnotations(mergedSettings.annotations);
+                      setHizbCursor(mergedSettings.hizbCursor);
+                      setHafsWarshMap(mergedSettings.hafsWarshMap ?? {});
+                      saveSettings(mergedSettings);
+                      setBackupError(null);
+                      alert(`✅ تم الاستيراد: ${normalized.length} صفحة`);
+                    } catch (err: any) { setBackupError(String(err.message ?? err)); }
+                    setBackupProg(null); e.target.value = "";
+                  }} />
+                {backupError && <div style={{ fontSize: 9, color: "#f87171" }}>{backupError}</div>}
+              </div>
+            </section>
+
+            <button style={{ ...S.toggle, fontSize: 10, color: "#f87171", border: "1px solid #f8717130" }} onClick={clearAll}>🗑️ Clear all</button>
+          </aside>
+
+          <div style={S.right}>
+            <section style={S.card}>
+              <div style={S.cardTitle}>📥 Input</div>
+              <div style={{ ...S.drop, ...(isDragging ? S.dropOn : {}) }}
+                onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
+                onDrop={(e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files[0]; if (f) { const r = new FileReader(); r.onload = (ev) => setHtml(ev.target?.result as string); r.readAsText(f); } }}
+                onClick={() => fileRef2.current?.click()}>
+                <input ref={fileRef2} type="file" accept=".html,.htm" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; if (f) { const r = new FileReader(); r.onload = (ev) => setHtml(ev.target?.result as string); r.readAsText(f); } }} />
+                <div style={{ fontSize: 20 }}>📄</div><div style={{ fontSize: 11, color: "#6b7280", marginTop: 3 }}>Drop .html or click</div>
+              </div>
+              <div style={S.orDiv}>— or paste —</div>
+              <textarea style={S.textarea} placeholder="Paste Quran page HTML here..." value={html} onChange={(e) => setHtml(e.target.value)} spellCheck={false} />
+              {looksEscaped && <div style={S.infoBanner}>🔄 Escaped chars detected — auto-unescape on process.</div>}
+              {error && <div style={S.errBanner}>❌ {error}</div>}
+              {isRunning && <div style={S.progressLabel}>⚙️ Parsing...</div>}
+              <button style={{ ...S.btn, ...(!canProcess ? S.btnOff : {}) }} onClick={process} disabled={!canProcess}>
+                {isRunning ? "Processing..." : "⚡ Process"}
+              </button>
+            </section>
+
+            {activeEntry && (
+              <section style={S.card}>
+                <div style={S.stats}>
+                  {([["Lines", activeEntry.parsed.lines.length], ["Words", activeEntry.parsed.lines.reduce((s,l)=>s+l.words.length,0)], ["Ayahs", activeEntry.parsed.segments.reduce((s,sg)=>s+sg.ayahs.length,0)], ["Edits", Object.keys(activeEntry.wordEdits??{}).length]] as [string,number][]).map(([l, v]) => (
+                    <div key={l} style={S.stat}><span style={S.statN}>{v}</span><span style={S.statL}>{l}</span></div>
+                  ))}
+                </div>
+                <div style={S.tabs}>
+                  {(["tsx","summary","preview","apis"] as const).map((t) => (
+                    <button key={t} style={{ ...S.tab, ...(outputTab === t ? S.tabOn : {}) }} onClick={() => setOutputTab(t)}>
+                      {t === "tsx" ? "📄 TSX" : t === "summary" ? "📊 Summary" : t === "preview" ? "✏️ Edit" : "🌐 APIs"}
+                    </button>
+                  ))}
+                  <div style={{ flex: 1 }} />
+                  <button style={S.actBtn} onClick={copy}>{copied ? "✅" : "📋"}</button>
+                  <button style={S.actBtn} onClick={download}>💾</button>
+                </div>
+
+                {outputTab === "tsx" && <pre style={S.pre}>{getTsx(activeEntry)}</pre>}
+
+                {outputTab === "summary" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {activeEntry.parsed.hizbMarks.length > 0 && (
+                      <div style={{ background: "#c9a96e10", border: "1px solid #c9a96e30", borderRadius: 6, padding: "8px 12px" }}>
+                        <div style={{ fontSize: 11, color: "#c9a96e", fontWeight: 700, marginBottom: 4 }}>📿 Hizb marks</div>
+                        {activeEntry.parsed.hizbMarks.map((h, i) => (
+                          <div key={i} style={{ fontSize: 11, color: "#e8e6e0" }}>{h.symbol} {h.label} — <code style={S.ic}>{h.positionId}</code></div>
+                        ))}
+                      </div>
+                    )}
+                    {activeEntry.parsed.segments.map((seg) => (
+                      <div key={seg.surahNumber}>
+                        <div style={S.secHd}>Surah {seg.surahNumber}{seg.surahTitle ? ` — ${seg.surahTitle}` : ""}</div>
+                        {seg.ayahs.map((a) => (
+                          <div key={a.aid} style={S.ayahRow}>
+                            <div style={S.ayahId}>
+                              {seg.surahNumber}:{a.ayahNum}
+                              {!a.isComplete && <span style={S.tagOrange}>→ next page</span>}
+                              {a.continuesFromPrev && <span style={S.tagPurple}>← prev page</span>}
+                            </div>
+                            <div style={{ fontSize: 18, fontFamily: "AALMAGHRIBI, serif", direction: "rtl", lineHeight: 1.8, color: "#e8e6e0" }}>
+                              {a.words.filter((w) => !w.isAyahMarker).map((w) => w.dataTxt).filter(Boolean).join(" ")}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {outputTab === "preview" && (
+                  <WordEditor
+                    entry={activeEntry}
+                    wordEdits={activeEntry.wordEdits ?? {}}
+                    onWordEdit={handleWordEdit}
+                    pageAlign={activeEntry.pageAlign ?? "justify"}
+                    wordGap={activeEntry.wordGap ?? 55}
+                    fontSize={activeEntry.fontSize ?? 32}
+                    lineGap={activeEntry.lineGap ?? 8}
+                    onPageAlignChange={handlePageAlignChange}
+                    onWordGapChange={handleWordGapChange}
+                    onFontSizeChange={handleFontSizeChange}
+                    onLineGapChange={handleLineGapChange}
+                    onApplyToAll={handleApplyToAll}
+                  />
+                )}
+
+                {outputTab === "apis" && (
+                  <TafsirAudioPanel activeEntry={activeEntry} onAnnotationSave={handleAnnSave} currentAnns={currentAnns} onCopyOverrideSave={handleCopyOverrideSave} />
+                )}
+              </section>
+            )}
+          </div>
+        </main>
+      )}
+
+      {/* BATCH IMPORT */}
+      {view === "import" && (
+        <main style={{ ...S.main, display: "block" }}>
+          <section style={S.card}>
+            <div style={S.cardTitle}>📦 Batch Import</div>
+            <BatchImportView onImportDone={handleBatchDone} hizbCursor={hizbCursor} onHizbCursorUpdate={setHizbCursor} />
+          </section>
+        </main>
+      )}
+
+      {/* HISTORY */}
+      {view === "history" && (
+        <main style={{ ...S.main, display: "block", maxWidth: 860 }}>
+          <section style={S.card}>
+            <HistoryPanel history={history} selectedId={activeEntry?.id ?? null}
+              onSelect={(e) => { setActiveEntry(e); setView("processor"); setOutputTab("tsx"); }}
+              onRemove={removeEntry} onRename={renameEntry} onExportManager={exportManager} />
+          </section>
+        </main>
+      )}
+
+      {/* PREVIEWER / EDITOR */}
+      {view === "previewer" && (
+        <main style={{ ...S.main, display: "block" }}>
+          <section style={S.card}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+              <div style={S.cardTitle}>✏️ Word Editor</div>
+              {history.length > 1 && (
+                <select style={{ ...S.input, width: "auto", minWidth: 220 }} value={activeEntry?.id ?? ""}
+                  onChange={(e) => { const f = history.find((h) => h.id === e.target.value); if (f) setActiveEntry(f); }}>
+                  {[...history].sort((a, b) => a.pageNumber - b.pageNumber).map((e) => <option key={e.id} value={e.id}>{e.label}</option>)}
+                </select>
+              )}
+            </div>
+            {!activeEntry ? <div style={{ color: "#4b5563", textAlign: "center", padding: "30px 0" }}>Process a page first.</div> : (
+              <WordEditor
+                entry={activeEntry}
+                wordEdits={activeEntry.wordEdits ?? {}}
+                onWordEdit={handleWordEdit}
+                pageAlign={activeEntry.pageAlign ?? "justify"}
+                wordGap={activeEntry.wordGap ?? 55}
+                fontSize={activeEntry.fontSize ?? 32}
+                lineGap={activeEntry.lineGap ?? 8}
+                onPageAlignChange={handlePageAlignChange}
+                onWordGapChange={handleWordGapChange}
+                onFontSizeChange={handleFontSizeChange}
+                onLineGapChange={handleLineGapChange}
+                onApplyToAll={handleApplyToAll}
+              />
+            )}
+          </section>
+        </main>
+      )}
+
+      {/* MAPPING */}
+      {view === "mapping" && (
+        <main style={{ ...S.main, display: "block", maxWidth: 1000 }}>
+          <section style={S.card}>
+            <HafsWarshMappingPanel history={history} hafsWarshMap={hafsWarshMap} onMapChange={setHafsWarshMap} />
+          </section>
+        </main>
+      )}
+
+      {/* MANAGER */}
+      {view === "manager" && (
+        <main style={{ ...S.main, display: "block", maxWidth: 1000 }}>
+          <section style={S.card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={S.cardTitle}>📋 Manager</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <button style={S.exportBtn} onClick={exportManager} disabled={history.length === 0}>📦 MushafManager.tsx</button>
+                <button style={{ ...S.exportBtn, background: "linear-gradient(135deg,#3b82f6,#1d4ed8)" }} disabled={history.length === 0}
+                  onClick={async () => {
+                    const sorted = [...history].sort((a, b) => a.pageNumber - b.pageNumber);
+                    try {
+                      const JZ = await loadJSZip();
+                      const zip = new JZ();
+                      const pagesDir = zip.folder("pages");
+                      for (const e of sorted) pagesDir.file(`Page${e.pageNumber}.tsx`, getTsx(e));
+                      zip.file("MushafManager.tsx", generateMushafManager(history));
+                      zip.file("hafs_warsh_map.json", JSON.stringify({ _version: 1, hafsWarshMap }, null, 2));
+                      zip.file("backup.json", JSON.stringify({ _version: BACKUP_VERSION, _date: new Date().toISOString(), settings: currentSettings(), pageIds: sorted.map(e => e.id) }, null, 2));
+                      const blob = await zip.generateAsync({ type: "blob" });
+                      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `quran-mushaf-${new Date().toISOString().slice(0,10)}.zip`; a.click();
+                    } catch (err: any) { alert("ZIP failed: " + err.message); }
+                  }}>📦 Export ZIP</button>
+              </div>
+            </div>
+            {history.length === 0 ? <div style={{ color: "#4b5563", textAlign: "center", padding: "30px 0" }}>No pages yet.</div> : (
+              <>
+                <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
+                  {[...history].sort((a, b) => a.pageNumber - b.pageNumber).map((e) => {
+                    const editCount = Object.keys(e.wordEdits ?? {}).length;
+                    const annCount  = Object.values(annotations[e.id] ?? {}).length;
+                    return (
+                      <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 10, background: "#0f1117", border: "1px solid #1e2332", borderRadius: 8, padding: "8px 12px" }}>
+                        <div style={{ ...S.historyPageBadge, fontSize: 13, minWidth: 34 }}>P{e.pageNumber}</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 12, color: "#e8e6e0" }}>{e.label}</div>
+                          <div style={{ fontSize: 10, color: "#4b5563", display: "flex", gap: 8, flexWrap: "wrap", marginTop: 2 }}>
+                            <span>S{e.surahNumbers.join(",")}</span>
+                            <span>{e.parsed.lines.length}L</span>
+                            <span style={{ color: "#6b7280" }}>align:{e.pageAlign ?? "justify"}</span>
+                            <span style={{ color: "#6b7280" }}>font:{e.fontSize ?? 32}px</span>
+                            {editCount > 0 && <span style={{ color: "#10b981" }}>{editCount} word edits</span>}
+                            {annCount > 0 && <span style={{ color: "#10b981" }}>{annCount} ann.</span>}
+                            {e.parsed.hasSajda && <span style={{ color: "#4ade80" }}>◆سجدة</span>}
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 5 }}>
+                          <button style={S.actBtn} onClick={() => { setActiveEntry(e); setView("previewer"); }}>✏️</button>
+                          <button style={S.actBtn} onClick={() => dl(getTsx(e), `page${e.pageNumber}.tsx`)}>TSX</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <pre style={{ ...S.pre, maxHeight: 320 }}>{generateMushafManager(history)}</pre>
+              </>
+            )}
+          </section>
+        </main>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SHARED STYLE TOKENS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const SP: Record<string, React.CSSProperties> = {
+  btn:       { padding: "4px 9px", background: "#1e2332", border: "1px solid #2a2f3e", borderRadius: 5, color: "#9ca3af", fontSize: 11, fontFamily: "inherit", cursor: "pointer" },
+  btnOn:     { background: "#c9a96e22", border: "1px solid #c9a96e55", color: "#c9a96e" },
+  btnGold:   { background: "#c9a96e22", color: "#c9a96e", border: "1px solid #c9a96e44" },
+  smallBtn:  { padding: "2px 6px", background: "#1e2332", border: "none", borderRight: "1px solid #2a2f3e", color: "#6b7280", fontSize: 11, fontFamily: "inherit", cursor: "pointer", borderRadius: 4 },
+  dim:       { fontSize: 10, color: "#6b7280" } as React.CSSProperties,
+  numInput:  { background: "#0a0c10", border: "1px solid #2a2f3e", borderRadius: 5, color: "#e8e6e0", padding: "4px 7px", fontSize: 12, fontFamily: "inherit", outline: "none", width: 80 } as React.CSSProperties,
+};
+
+const S: Record<string, React.CSSProperties> = {
+  root:             { minHeight: "100vh", background: "#0f1117", color: "#e8e6e0", fontFamily: "'JetBrains Mono','Fira Code',monospace", fontSize: 13 },
+  header:           { background: "linear-gradient(135deg,#1a1f2e,#12151f)", borderBottom: "1px solid #2a2f3e", padding: "11px 20px", position: "sticky", top: 0, zIndex: 100 },
+  hInner:           { display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 1400, margin: "0 auto", gap: 14 },
+  logo:             { display: "flex", alignItems: "center", gap: 10, flexShrink: 0 },
+  logoAr:           { fontSize: 24, fontFamily: "AALMAGHRIBI, serif", color: "#c9a96e" },
+  logoTitle:        { fontSize: 13, fontWeight: 700, color: "#f0ece4" },
+  logoSub:          { fontSize: 9, color: "#6b7280", marginTop: 1 },
+  nav:              { display: "flex", gap: 3, flexShrink: 0 },
+  navBtn:           { padding: "5px 9px", background: "transparent", border: "1px solid #2a2f3e", borderRadius: 5, color: "#6b7280", fontSize: 11, fontFamily: "inherit", cursor: "pointer", display: "flex", alignItems: "center", gap: 4 },
+  navBtnOn:         { background: "#c9a96e22", border: "1px solid #c9a96e55", color: "#c9a96e" },
+  navBadge:         { background: "#c9a96e", color: "#0f1117", borderRadius: 10, padding: "0 5px", fontSize: 9, fontWeight: 700 },
+  main:             { display: "flex", gap: 16, maxWidth: 1400, margin: "0 auto", padding: "16px 20px", alignItems: "flex-start" },
+  left:             { width: 240, flexShrink: 0, display: "flex", flexDirection: "column", gap: 10 },
+  right:            { flex: 1, display: "flex", flexDirection: "column", gap: 10, minWidth: 0 },
+  card:             { background: "#151820", border: "1px solid #1e2332", borderRadius: 10, padding: 14 },
+  cardTitle:        { fontSize: 10, fontWeight: 700, color: "#c9a96e", letterSpacing: "0.08em", marginBottom: 10, textTransform: "uppercase" },
+  label:            { fontSize: 10, color: "#6b7280" },
+  input:            { background: "#0f1117", border: "1px solid #2a2f3e", borderRadius: 5, color: "#e8e6e0", padding: "5px 9px", fontSize: 12, fontFamily: "inherit", outline: "none", width: "100%", boxSizing: "border-box" },
+  ic:               { background: "#0f1117", border: "1px solid #2a2f3e", borderRadius: 3, padding: "0 4px", color: "#7dd3fc", fontSize: 10 },
+  row:              { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 },
+  toggle:           { background: "#1e2332", border: "1px solid #2a2f3e", borderRadius: 4, color: "#6b7280", padding: "3px 12px", fontSize: 11, fontFamily: "inherit", cursor: "pointer" },
+  toggleOn:         { background: "#c9a96e22", border: "1px solid #c9a96e55", color: "#c9a96e" },
+  drop:             { border: "2px dashed #2a2f3e", borderRadius: 7, padding: "12px", textAlign: "center", cursor: "pointer", marginBottom: 8, transition: "all .2s" },
+  dropOn:           { borderColor: "#c9a96e", background: "#c9a96e08" },
+  orDiv:            { textAlign: "center", color: "#3a3f4e", fontSize: 10, margin: "4px 0" },
+  textarea:         { width: "100%", height: 110, background: "#0f1117", border: "1px solid #2a2f3e", borderRadius: 7, color: "#e8e6e0", padding: 9, fontSize: 11, fontFamily: "inherit", resize: "vertical", outline: "none", boxSizing: "border-box", lineHeight: 1.4 },
+  infoBanner:       { background: "#3b82f610", border: "1px solid #3b82f630", borderRadius: 5, padding: "5px 9px", fontSize: 10, color: "#60a5fa", marginTop: 6 },
+  errBanner:        { background: "#ef444410", border: "1px solid #ef444430", borderRadius: 5, padding: "5px 9px", fontSize: 10, color: "#f87171", marginTop: 6 },
+  progressLabel:    { fontSize: 10, color: "#9ca3af", marginBottom: 3 },
+  pTrack:           { height: 4, background: "#1e2332", borderRadius: 4, overflow: "hidden" },
+  pFill:            { height: "100%", background: "#c9a96e", borderRadius: 4, transition: "width 0.1s" },
+  btn:              { width: "100%", marginTop: 8, padding: 10, background: "linear-gradient(135deg,#c9a96e,#a07840)", border: "none", borderRadius: 7, color: "#0f1117", fontSize: 12, fontWeight: 700, fontFamily: "inherit", cursor: "pointer" },
+  btnOff:           { opacity: 0.4, cursor: "not-allowed" },
+  stats:            { display: "flex", marginBottom: 8, background: "#0f1117", borderRadius: 7, overflow: "hidden", border: "1px solid #1e2332" },
+  stat:             { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", padding: "6px 3px", borderRight: "1px solid #1e2332" },
+  statN:            { fontSize: 14, fontWeight: 700, color: "#c9a96e" },
+  statL:            { fontSize: 8, color: "#6b7280", marginTop: 1, textTransform: "uppercase" },
+  tabs:             { display: "flex", gap: 4, marginBottom: 8, alignItems: "center", borderBottom: "1px solid #1e2332", paddingBottom: 7 },
+  tab:              { padding: "3px 9px", background: "transparent", border: "1px solid #2a2f3e", borderRadius: 5, color: "#6b7280", fontSize: 11, fontFamily: "inherit", cursor: "pointer" },
+  tabOn:            { background: "#c9a96e22", border: "1px solid #c9a96e44", color: "#c9a96e" },
+  actBtn:           { padding: "3px 9px", background: "#1e2332", border: "1px solid #2a2f3e", borderRadius: 5, color: "#9ca3af", fontSize: 11, fontFamily: "inherit", cursor: "pointer" },
+  exportBtn:        { padding: "5px 12px", background: "linear-gradient(135deg,#c9a96e,#a07840)", border: "none", borderRadius: 5, color: "#0f1117", fontSize: 11, fontWeight: 700, fontFamily: "inherit", cursor: "pointer" },
+  pre:              { background: "#0a0c10", border: "1px solid #1e2332", borderRadius: 7, padding: 12, fontSize: 10, lineHeight: 1.5, overflowX: "auto", maxHeight: 560, overflowY: "auto", color: "#9ca3af", margin: 0, whiteSpace: "pre" },
+  secHd:            { fontSize: 10, fontWeight: 700, color: "#c9a96e", textTransform: "uppercase", letterSpacing: "0.06em", padding: "7px 0 3px", borderTop: "1px solid #1e2332", marginTop: 4 },
+  ayahRow:          { background: "#0f1117", border: "1px solid #1e2332", borderRadius: 5, padding: "6px 10px", marginBottom: 4 },
+  ayahId:           { fontSize: 11, color: "#c9a96e", fontWeight: 700, display: "flex", gap: 7, alignItems: "center", marginBottom: 3 },
+  tagOrange:        { background: "#f9731622", border: "1px solid #f9731644", color: "#fb923c", borderRadius: 3, padding: "0 5px", fontSize: 9 },
+  tagPurple:        { background: "#6366f122", border: "1px solid #6366f144", color: "#818cf8", borderRadius: 3, padding: "0 5px", fontSize: 9 },
+  historyItem:      { display: "flex", alignItems: "center", gap: 8, background: "#0f1117", border: "1px solid #1e2332", borderRadius: 7, padding: "6px 9px" },
+  historyItemSel:   { border: "1px solid #c9a96e55", background: "#c9a96e08" },
+  historyPageBadge: { background: "#c9a96e22", color: "#c9a96e", border: "1px solid #c9a96e44", borderRadius: 3, padding: "1px 6px", fontSize: 10, fontWeight: 700, flexShrink: 0 },
+  miniBtn:          { padding: "2px 6px", background: "#1e2332", border: "1px solid #2a2f3e", borderRadius: 3, color: "#9ca3af", fontSize: 11, fontFamily: "inherit", cursor: "pointer" },
+  recentItem:       { display: "flex", alignItems: "center", gap: 7, padding: "3px 5px", borderRadius: 5, cursor: "pointer", marginBottom: 2 },
+  recentItemOn:     { background: "#c9a96e10" },
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+function guessPageNumber(filename: string): number {
+  const m = filename.match(/(?:page[_\-\s]?)?(\d+)/i);
+  return m ? parseInt(m[1]) : 0;
+}
+const dl = (text: string, name: string) => {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" })); a.download = name; a.click();
+};
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}><label style={S.label}>{label}</label>{children}</div>;
+}
